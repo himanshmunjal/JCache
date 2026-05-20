@@ -1,0 +1,10 @@
+#name: Run benchmarks
+#run: |
+#  java -jar cache-benchmark/target/benchmarks.jar PolicyComparison \
+#    -f 2 -wi 3 -i 5 -rf json -rff results.json
+#
+#name: Upload benchmark results
+#uses: actions/upload-artifact@v3
+#with:
+#  name: benchmark-results
+#  path: results.json
