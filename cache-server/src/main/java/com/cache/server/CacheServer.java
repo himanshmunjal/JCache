@@ -6,6 +6,7 @@ import com.cache.policy.ARCCache;
 import com.cache.policy.LFUCache;
 import com.cache.policy.LRUCache;
 import com.cache.server.handler.CacheServerHandler;
+import com.cache.server.metrics.ServerMetrics;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -160,6 +161,7 @@ public class CacheServer {
      * Tests and programmatic callers can await this instead of sleeping.
      */
     private final CountDownLatch startLatch = new CountDownLatch(1);
+    private ServerMetrics metrics = new ServerMetrics();
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -176,6 +178,7 @@ public class CacheServer {
             throw new IllegalArgumentException("ServerConfig cannot be null");
         }
         this.config = config;
+        this.metrics = metrics;
         this.cache  = buildCache(config);
     }
 
@@ -428,7 +431,7 @@ public class CacheServer {
 
                         // APPLICATION handler — your cache logic:
                         pipeline.addLast("cacheHandler",
-                                new CacheServerHandler(cache, config));
+                                new CacheServerHandler(cache, metrics ,config));
                     }
                 });
     }
