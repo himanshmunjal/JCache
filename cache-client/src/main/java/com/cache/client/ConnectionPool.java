@@ -1,338 +1,240 @@
 package com.cache.client;
 
-import java.io.Closeable;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * ConnectionPool manages a fixed pool of CacheClient connections,
- * allowing multiple threads to use the cache server concurrently
- * without paying TCP handshake overhead on every request.
+ * ConnectionPool manages a fixed-size pool of reusable TCP connections
+ * to a single CacheServer instance.
  *
- * PROBLEM THIS SOLVES:
- *   Each new CacheClient("localhost", 6379) pays:
- *     - TCP 3-way handshake:     ~0.5–2ms on localhost, ~10–100ms on network
- *     - Socket buffer allocation: small but adds up
- *   At 10,000 requests/second with a new connection per request:
- *     10,000 × 1ms = 10 seconds of handshake overhead per second of work.
- *   A pool creates N connections once at startup and reuses them.
- *   Subsequent borrows/returns are just ArrayBlockingQueue.poll() / offer() — nanoseconds.
+ * WHY A CONNECTION POOL?
+ * Opening a TCP connection involves a 3-way handshake (~1ms on localhost,
+ * ~10-100ms over a network). If every cache operation opened and closed its
+ * own connection, that handshake latency would dominate. A pool pre-opens N
+ * connections at startup and lends them to callers. The caller does its
+ * operation and returns the connection. Next caller gets it immediately —
+ * zero handshake cost. This is exactly how HikariCP and Jedis pool work.
  *
- * HOW IT WORKS:
- *   1. At construction, N CacheClient connections are created and placed in a queue.
- *   2. A caller calls acquire() — blocks until a connection is available.
- *   3. Caller uses the connection (get/put/delete).
- *   4. Caller calls release(client) — returns it to the queue.
- *   5. If a connection is unhealthy (ping fails), it's discarded and replaced.
- *
- * DATA STRUCTURE — ArrayBlockingQueue:
- *   - Thread-safe: no external synchronization needed
- *   - Blocking: acquire() waits if pool is empty (all connections in use)
- *   - Bounded: prevents unlimited connection growth
- *   - FIFO: connections are reused in order, giving roughly even load
- *
- * WHY NOT SYNCHRONIZED LIST?
- *   A synchronized list + wait/notify requires manual locking.
- *   ArrayBlockingQueue is purpose-built for producer-consumer patterns,
- *   uses efficient internal locking (two separate locks for head/tail),
- *   and is battle-tested in production systems. No reason to reinvent it.
- *
- * HEALTH CHECKING:
- *   On release(), we PING the connection before returning it to the pool.
- *   If PING fails (server closed the connection, network blip), we discard
- *   the connection and create a fresh one.
- *   This "validate on return" strategy ensures the pool never hands out
- *   a stale connection to a caller.
- *
- *   Alternative: "validate on borrow" — check health when acquiring, not releasing.
- *   Trade-off: validate-on-return catches failures earlier (right when they happen)
- *   and doesn't add latency to the acquire() path. That's why we chose it.
- *
- * TYPICAL USAGE:
- *   // Create pool with 8 connections, 5-second acquire timeout
- *   ConnectionPool pool = new ConnectionPool("localhost", 6379, 8, 5000);
- *
- *   // In a request handler (called from multiple threads):
- *   CacheClient client = pool.acquire();
- *   try {
- *       String value = client.get("session:user1");
- *       // ... use value ...
- *   } finally {
- *       pool.release(client); // ALWAYS release in finally block
- *   }
- *
- *   // Shutdown (e.g., in server shutdown hook):
- *   pool.close();
+ * DESIGN:
+ *   - Fixed pool size: N connections created at startup, never more.
+ *   - BlockingQueue as the pool: thread-safe, supports blocking acquire.
+ *   - acquire() blocks if all connections are in use, up to a timeout.
+ *   - release() returns the connection to the queue for reuse.
+ *   - Unhealthy connections are replaced transparently on release.
  *
  * THREAD SAFETY:
- *   ConnectionPool is fully thread-safe.
- *   acquire() and release() can be called from any thread concurrently.
- *   The pool size is fixed — it never grows or shrinks dynamically.
- *   (Dynamic sizing is possible but adds significant complexity — YAGNI here.)
+ *   ArrayBlockingQueue is fully thread-safe. Multiple threads can call
+ *   acquire() and release() concurrently without additional locking.
+ *   AtomicInteger for activeCount avoids lock overhead on monitoring reads.
+ *
+ * USAGE:
+ *   ConnectionPool pool = new ConnectionPool("localhost", 6379, 5);
+ *   CacheClient conn = pool.acquire();
+ *   try {
+ *       conn.put("key", "value");
+ *   } finally {
+ *       pool.release(conn);   // ALWAYS release in a finally block
+ *   }
+ *   pool.close();             // at application shutdown
  */
-public class ConnectionPool implements Closeable {
+public class ConnectionPool {
 
     // -------------------------------------------------------------------------
     // Constants
     // -------------------------------------------------------------------------
 
-    /** Default number of connections in the pool. */
-    public static final int DEFAULT_POOL_SIZE = 8;
-
     /**
-     * Default acquire timeout in milliseconds.
-     * If no connection is available within 5 seconds, acquire() throws.
-     * 5 seconds is generous — if all connections are held for 5 seconds,
-     * something is wrong (leaked connection, slow server).
+     * Default timeout for acquire() when no explicit timeout is given.
+     * 5 seconds is generous — if no connection is free in 5 seconds,
+     * the caller has a problem larger than pool configuration.
      */
-    public static final long DEFAULT_ACQUIRE_TIMEOUT_MS = 5_000;
-
-    /**
-     * How many times to retry creating a replacement connection on health failure.
-     * Three attempts with 100ms between them handles transient network hiccups
-     * without giving up too quickly.
-     */
-    private static final int REPLACEMENT_RETRY_COUNT = 3;
-    private static final long REPLACEMENT_RETRY_DELAY_MS = 100;
+    private static final long DEFAULT_ACQUIRE_TIMEOUT_MS = 5000L;
 
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
 
-    /** Remote server hostname. */
+    /** Server hostname — all connections in this pool go to the same host. */
     private final String host;
 
-    /** Remote server port. */
+    /** Server port — all connections in this pool go to the same port. */
     private final int port;
 
-    /** Maximum number of connections in this pool. */
+    /** Maximum number of connections maintained by this pool. */
     private final int poolSize;
 
     /**
-     * Maximum time in milliseconds to wait for an available connection.
-     * If no connection is available within this window, acquire() throws
-     * PoolExhaustedException.
-     */
-    private final long acquireTimeoutMs;
-
-    /**
-     * The connection queue — the heart of the pool.
+     * The pool itself: a bounded queue of idle connections.
      *
-     * Available connections sit here. acquire() removes one (blocks if empty).
-     * release() adds one back (never blocks — pool can never exceed poolSize).
+     * BlockingQueue semantics used here:
+     *   poll(timeout, unit) — take head, waiting up to timeout. Returns null on timeout.
+     *   offer(conn)         — add to tail. Returns false if full (handled as bug guard).
      *
-     * ArrayBlockingQueue is bounded, so offer() on a full queue returns false
-     * immediately rather than blocking. We use this to detect pool logic bugs
-     * (if a caller releases more connections than they acquired, we detect it).
+     * ArrayBlockingQueue chosen over LinkedBlockingQueue because:
+     *   1. Fixed capacity matches our fixed pool size — bounded by design.
+     *   2. Array layout is more CPU-cache friendly than linked nodes.
      */
     private final BlockingQueue<CacheClient> availableConnections;
 
     /**
-     * Total number of connections this pool has ever created (including replacements).
-     * Useful for monitoring — if this grows continuously, connections are leaking.
+     * All connections ever created — used for cleanup in close().
+     * Separate from availableConnections because connections currently
+     * in use (acquired) are not in the queue.
      */
-    private final AtomicInteger totalCreated = new AtomicInteger(0);
+    private final List<CacheClient> allConnections;
 
     /**
-     * Number of connections discarded due to health check failures.
-     * High numbers indicate network instability or server restarts.
+     * Count of connections currently lent out (acquired but not released).
+     * AtomicInteger for lock-free stat reads.
+     *
+     * Invariant when pool is healthy:
+     *   activeCount + availableConnections.size() == poolSize
      */
-    private final AtomicInteger totalDiscarded = new AtomicInteger(0);
+    private final AtomicInteger activeCount;
 
     /**
-     * Number of currently active (acquired, not yet released) connections.
-     * Should never exceed poolSize. If it does, there's a release() leak.
+     * Closed flag. After close(), acquire() throws immediately.
+     * volatile ensures visibility across threads without locking.
      */
-    private final AtomicInteger activeConnections = new AtomicInteger(0);
-
-    /**
-     * Whether this pool has been closed.
-     * After close(), acquire() throws IllegalStateException.
-     */
-    private volatile boolean closed = false;
+    private volatile boolean closed;
 
     // -------------------------------------------------------------------------
-    // Constructors
+    // Constructor
     // -------------------------------------------------------------------------
 
     /**
-     * Creates a pool with default size (8 connections) and default acquire timeout.
+     * Creates a ConnectionPool and eagerly opens all N connections.
      *
-     * @param host Server hostname.
-     * @param port Server port.
-     * @throws IOException if initial connections cannot be established.
+     * Eager (not lazy) initialization front-loads the TCP handshake cost
+     * to startup rather than spreading it across the first N requests.
+     * This matches what HikariCP and Jedis pool do by default.
+     *
+     * @param host     Hostname of the CacheServer (e.g., "localhost").
+     * @param port     Port the CacheServer listens on (e.g., 6379).
+     * @param poolSize Number of connections to maintain. Must be >= 1.
+     * @throws IllegalArgumentException if arguments are invalid.
+     * @throws RuntimeException         if any connection fails to open at startup.
      */
-    public ConnectionPool(String host, int port) throws IOException {
-        this(host, port, DEFAULT_POOL_SIZE, DEFAULT_ACQUIRE_TIMEOUT_MS);
-    }
-
-    /**
-     * Creates a pool with a custom size and acquire timeout.
-     *
-     * CHOOSING POOL SIZE:
-     *   Too small: callers block frequently waiting for connections.
-     *   Too large: server has too many concurrent connections; memory overhead.
-     *   Rule of thumb: pool_size = expected_concurrent_threads × 1.2
-     *   For an 8-worker-thread web server: pool_size = 8–12.
-     *
-     * @param host             Server hostname.
-     * @param port             Server port.
-     * @param poolSize         Number of connections to pre-create and maintain.
-     * @param acquireTimeoutMs Max milliseconds to wait for an available connection.
-     * @throws IOException if initial connections cannot be established.
-     */
-    public ConnectionPool(String host, int port, int poolSize, long acquireTimeoutMs)
-            throws IOException {
-        if (host == null || host.isEmpty()) {
-            throw new IllegalArgumentException("Host cannot be null or empty");
+    public ConnectionPool(String host, int port, int poolSize) {
+        if (host == null || host.isBlank()) {
+            throw new IllegalArgumentException("Host cannot be null or blank");
         }
         if (port < 1 || port > 65535) {
-            throw new IllegalArgumentException("Port must be between 1 and 65535");
+            throw new IllegalArgumentException("Port must be in [1, 65535], got: " + port);
         }
         if (poolSize < 1) {
-            throw new IllegalArgumentException("Pool size must be >= 1");
-        }
-        if (acquireTimeoutMs < 0) {
-            throw new IllegalArgumentException("Acquire timeout cannot be negative");
+            throw new IllegalArgumentException("Pool size must be >= 1, got: " + poolSize);
         }
 
-        this.host              = host;
-        this.port              = port;
-        this.poolSize          = poolSize;
-        this.acquireTimeoutMs  = acquireTimeoutMs;
+        this.host                 = host;
+        this.port                 = port;
+        this.poolSize             = poolSize;
+        this.activeCount          = new AtomicInteger(0);
+        this.closed               = false;
         this.availableConnections = new ArrayBlockingQueue<>(poolSize);
+        this.allConnections       = new ArrayList<>(poolSize);
 
-        initializePool();
+        initializeConnections();
     }
 
     // -------------------------------------------------------------------------
-    // Core pool operations
+    // Core API
     // -------------------------------------------------------------------------
 
     /**
-     * Acquires a connection from the pool, blocking until one is available.
+     * Acquires a connection from the pool, blocking up to DEFAULT_ACQUIRE_TIMEOUT_MS
+     * (5 seconds) if all connections are currently in use.
      *
-     * BLOCKING BEHAVIOR:
-     *   If all connections are currently in use, this method blocks until:
-     *     a) A connection is released by another thread, OR
-     *     b) The acquireTimeoutMs elapses → throws PoolExhaustedException
+     * CONTRACT: every acquire() MUST be paired with a release() in a finally block.
      *
-     * ALWAYS pair with release() in a finally block:
-     *   CacheClient client = pool.acquire();
-     *   try {
-     *       // use client
-     *   } finally {
-     *       pool.release(client);  // ← never skip this
-     *   }
-     *
-     * If you forget release(), the connection is leaked and the pool starves.
-     * With poolSize=8, just 8 leaked connections deadlock all future callers.
-     *
-     * @return A healthy CacheClient ready to use.
-     * @throws PoolExhaustedException if no connection becomes available within timeout.
+     * @return A healthy, connected CacheClient ready for use.
+     * @throws TimeoutException      if no connection is available within 5 seconds.
      * @throws IllegalStateException if the pool has been closed.
-     * @throws InterruptedException if the thread is interrupted while waiting.
+     * @throws InterruptedException  if the thread is interrupted while waiting.
      */
-    public CacheClient acquire() throws IOException, InterruptedException {
+    public CacheClient acquire() throws TimeoutException, InterruptedException {
+        return acquireWithTimeout(DEFAULT_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Acquires a connection from the pool, blocking up to the specified timeout.
+     *
+     * This is the method exercised by CacheClientTest.testConnectionPool_exhaustionThrows:
+     *   pool.acquireWithTimeout(100, TimeUnit.MILLISECONDS)
+     *   → throws TimeoutException when pool is exhausted and timeout elapses.
+     *
+     * @param timeout  Maximum time to wait for a connection.
+     * @param timeUnit Unit for the timeout.
+     * @return A healthy, connected CacheClient.
+     * @throws TimeoutException      if no connection becomes available in time.
+     * @throws IllegalStateException if the pool has been closed.
+     * @throws InterruptedException  if the thread is interrupted while waiting.
+     */
+    public CacheClient acquireWithTimeout(long timeout, TimeUnit timeUnit)
+            throws TimeoutException, InterruptedException {
+
         if (closed) {
             throw new IllegalStateException("ConnectionPool is closed");
         }
 
-        // poll() with timeout: blocks up to acquireTimeoutMs, returns null on timeout.
-        // This is the key difference from take() (which blocks forever).
-        CacheClient client = availableConnections.poll(acquireTimeoutMs, TimeUnit.MILLISECONDS);
+        // poll(timeout, unit): removes and returns the head of the queue,
+        // waiting up to timeout if the queue is currently empty.
+        // Returns null if the timeout elapses before a connection is available.
+        CacheClient connection = availableConnections.poll(timeout, timeUnit);
 
-        if (client == null) {
-            // Timeout elapsed — no connection became available.
-            throw new PoolExhaustedException(
-                    "No connection available after " + acquireTimeoutMs + "ms. " +
-                            "Pool size: " + poolSize + ", active: " + activeConnections.get()
-            );
+        if (connection == null) {
+            throw new TimeoutException(String.format(
+                    "No connection available within %d %s. Pool size=%d, active=%d",
+                    timeout, timeUnit, poolSize, activeCount.get()
+            ));
         }
 
-        activeConnections.incrementAndGet();
-        return client;
+        // Health check — the connection might have gone stale if the server
+        // restarted or a firewall idle-timeout closed the socket silently.
+        if (!isConnectionHealthy(connection)) {
+            connection = replaceConnection(connection);
+            if (connection == null) {
+                throw new RuntimeException("Failed to replace broken connection");
+            }
+        }
+
+        activeCount.incrementAndGet();
+        return connection;
     }
 
     /**
      * Returns a connection to the pool after use.
      *
-     * HEALTH CHECK ON RETURN:
-     *   We PING the connection before returning it.
-     *   If the ping fails (server closed connection, network error), we:
-     *     1. Discard the unhealthy connection (close it).
-     *     2. Create a fresh replacement connection.
-     *     3. Add the replacement to the pool instead.
-     *   This guarantees the pool always contains live connections.
+     * If the connection is broken (server closed it during the operation),
+     * release() replaces it with a fresh one before re-queuing, so the
+     * next acquire() always receives a healthy connection.
      *
-     * IMPORTANT: Call this in a finally block. Never skip release().
-     *
-     * @param client The connection to return. If null, this method is a no-op.
+     * @param connection The connection to return. Must have come from acquire().
      */
-    public void release(CacheClient client) {
-        if (client == null) {
-            return;
+    public void release(CacheClient connection) {
+        if (connection == null || closed) return;
+
+        activeCount.decrementAndGet();
+
+        // Replace broken connections transparently.
+        if (!isConnectionHealthy(connection)) {
+            try { connection.close(); } catch (Exception ignored) {}
+            connection = createConnection();
+            if (connection == null) return; // pool temporarily shrinks; acceptable
         }
 
-        activeConnections.decrementAndGet();
-
-        if (closed) {
-            // Pool was closed while this connection was in use — just close it.
-            client.close();
-            return;
+        // Return to the available queue.
+        // offer() returns false if the queue is full, which indicates a
+        // double-release bug. Close the extra connection rather than leak it.
+        boolean offered = availableConnections.offer(connection);
+        if (!offered) {
+            try { connection.close(); } catch (Exception ignored) {}
         }
-
-        // Validate the connection before returning it to the pool.
-        if (isHealthy(client)) {
-            boolean offered = availableConnections.offer(client);
-            if (!offered) {
-                // Queue is full — this shouldn't happen if acquire/release are balanced.
-                // Likely indicates a bug (more releases than acquires). Close and discard.
-                System.err.println("[ConnectionPool] WARNING: Pool queue full on release. " +
-                        "Possible connection leak. Discarding connection.");
-                client.close();
-                totalDiscarded.incrementAndGet();
-            }
-        } else {
-            // Connection is unhealthy — discard and replace.
-            client.close();
-            totalDiscarded.incrementAndGet();
-            replaceConnection();
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Pool management
-    // -------------------------------------------------------------------------
-
-    /**
-     * Closes all connections in the pool and marks the pool as closed.
-     * After this, acquire() will throw IllegalStateException.
-     *
-     * Call this in a server shutdown hook or @AfterAll in tests.
-     *
-     * NOTE: Connections currently acquired (not yet released) are NOT closed here.
-     * When those callers call release(), release() detects the pool is closed
-     * and closes the connection directly instead of returning it to the queue.
-     */
-    @Override
-    public void close() {
-        closed = true;
-
-        // Drain all available connections and close them.
-        List<CacheClient> remaining = new ArrayList<>();
-        availableConnections.drainTo(remaining);
-        for (CacheClient client : remaining) {
-            client.close();
-        }
-
-        System.out.printf("[ConnectionPool] Closed. Created: %d, Discarded: %d%n",
-                totalCreated.get(), totalDiscarded.get());
     }
 
     // -------------------------------------------------------------------------
@@ -340,60 +242,57 @@ public class ConnectionPool implements Closeable {
     // -------------------------------------------------------------------------
 
     /**
-     * Returns the number of connections currently available (not in use).
-     * For monitoring and debugging.
+     * Returns the number of connections currently lent out (in use by callers).
      *
-     * @return Number of idle connections in the pool.
+     * Used by CacheClientTest:
+     *   assertTrue(pool.getActiveCount() <= poolSize)
+     *
+     * @return Number of acquired-but-not-released connections.
      */
-    public int availableCount() {
+    public int getActiveCount() {
+        return activeCount.get();
+    }
+
+    /**
+     * Returns the number of connections currently idle in the pool.
+     *
+     * @return Number of available connections ready for acquire().
+     */
+    public int getIdleCount() {
         return availableConnections.size();
     }
 
     /**
-     * Returns the number of connections currently acquired (in use by callers).
+     * Returns the configured pool capacity.
      *
-     * @return Number of active (borrowed) connections.
-     */
-    public int activeCount() {
-        return activeConnections.get();
-    }
-
-    /**
-     * Returns the total number of connections ever created by this pool,
-     * including initial connections and replacements for failed ones.
-     *
-     * @return Total created connection count.
-     */
-    public int totalCreatedCount() {
-        return totalCreated.get();
-    }
-
-    /**
-     * Returns the total number of connections discarded due to health failures.
-     * High numbers indicate server instability or network issues.
-     *
-     * @return Total discarded connection count.
-     */
-    public int totalDiscardedCount() {
-        return totalDiscarded.get();
-    }
-
-    /**
-     * Returns the configured maximum pool size.
-     *
-     * @return Pool size (maximum concurrent connections).
+     * @return Pool size set at construction.
      */
     public int getPoolSize() {
         return poolSize;
     }
 
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
+
     /**
-     * Returns whether this pool has been closed.
+     * Closes all idle connections and marks this pool as shut down.
      *
-     * @return true if closed.
+     * Connections still in use (acquired but not released) are NOT forcibly
+     * closed — the caller is responsible for those. In practice, always call
+     * close() after all acquire/release cycles are complete (e.g., in @AfterAll).
+     *
+     * Idempotent — safe to call multiple times.
      */
-    public boolean isClosed() {
-        return closed;
+    public void close() {
+        if (closed) return;
+        closed = true;
+
+        CacheClient conn;
+        while ((conn = availableConnections.poll()) != null) {
+            try { conn.close(); } catch (Exception ignored) {}
+        }
+        allConnections.clear();
     }
 
     // -------------------------------------------------------------------------
@@ -401,112 +300,82 @@ public class ConnectionPool implements Closeable {
     // -------------------------------------------------------------------------
 
     /**
-     * Creates all initial connections and fills the pool queue.
-     * Called once from the constructor.
-     *
-     * If ANY connection fails to create (e.g., server not running),
-     * we throw immediately. A partially-initialized pool would be confusing
-     * to debug — better to fail fast with a clear error.
-     *
-     * @throws IOException if any connection fails.
+     * Opens all pool connections eagerly at construction time.
      */
-    private void initializePool() throws IOException {
+    private void initializeConnections() {
         for (int i = 0; i < poolSize; i++) {
-            try {
-                CacheClient client = new CacheClient(host, port);
-                availableConnections.offer(client);
-                totalCreated.incrementAndGet();
-            } catch (IOException e) {
-                // Close any connections we already created before throwing.
-                close();
-                throw new IOException(
-                        "Failed to initialize connection pool (created " + i + "/" + poolSize +
-                                " connections): " + e.getMessage(), e
-                );
+            CacheClient connection = createConnection();
+            if (connection == null) {
+                close(); // clean up what we opened so far
+                throw new RuntimeException(String.format(
+                        "Failed to open connection %d/%d to %s:%d during pool initialization",
+                        i + 1, poolSize, host, port
+                ));
             }
+            allConnections.add(connection);
+            availableConnections.offer(connection);
         }
-        System.out.printf("[ConnectionPool] Initialized with %d connections to %s:%d%n",
-                poolSize, host, port);
     }
 
     /**
-     * Checks if a connection is healthy by sending a PING.
-     * Returns false if the ping fails for any reason.
+     * Opens a single new TCP connection to the server.
      *
-     * WHY PING instead of just checking socket.isConnected()?
-     * socket.isConnected() returns true even for dead connections — the JVM doesn't
-     * detect a closed remote socket until you actually try to read/write.
-     * PING forces an actual read/write cycle, revealing dead connections.
-     *
-     * @param client The connection to check.
-     * @return true if the connection responded to PING.
+     * @return A connected CacheClient, or null if the attempt fails.
      */
-    private boolean isHealthy(CacheClient client) {
-        if (!client.isConnected()) {
+    private CacheClient createConnection() {
+        try {
+            return new CacheClient(host, port);
+        } catch (Exception e) {
+            System.err.printf("[ConnectionPool] Failed to create connection to %s:%d — %s%n",
+                    host, port, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Checks whether a connection is alive using a PING command.
+     * A broken connection (dropped socket, server restart) returns false here.
+     *
+     * @param connection The connection to check.
+     * @return true if the server responds to PING with PONG.
+     */
+    private boolean isConnectionHealthy(CacheClient connection) {
+        try {
+            return connection != null && connection.ping();
+        } catch (Exception e) {
             return false;
         }
-        return client.ping();
     }
 
     /**
-     * Creates a replacement connection and adds it to the pool.
-     * Called when a returned connection fails its health check.
+     * Closes a broken connection and opens a fresh replacement.
+     * Updates allConnections to track the new connection.
      *
-     * Retries REPLACEMENT_RETRY_COUNT times with REPLACEMENT_RETRY_DELAY_MS between attempts.
-     * If all retries fail (server is down), logs the failure and leaves the pool
-     * one connection short. The next successful release will still return its connection,
-     * so the pool self-heals when the server comes back.
+     * @param broken The unhealthy connection to replace.
+     * @return A new healthy CacheClient, or null if replacement fails.
      */
-    private void replaceConnection() {
-        for (int attempt = 1; attempt <= REPLACEMENT_RETRY_COUNT; attempt++) {
-            try {
-                CacheClient fresh = new CacheClient(host, port);
-                availableConnections.offer(fresh);
-                totalCreated.incrementAndGet();
-                System.out.printf("[ConnectionPool] Replaced unhealthy connection (attempt %d)%n",
-                        attempt);
-                return;
-            } catch (IOException e) {
-                System.err.printf("[ConnectionPool] Failed to create replacement connection " +
-                        "(attempt %d/%d): %s%n", attempt, REPLACEMENT_RETRY_COUNT, e.getMessage());
+    private CacheClient replaceConnection(CacheClient broken) {
+        try { broken.close(); } catch (Exception ignored) {}
 
-                if (attempt < REPLACEMENT_RETRY_COUNT) {
-                    try {
-                        Thread.sleep(REPLACEMENT_RETRY_DELAY_MS);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                }
+        CacheClient replacement = createConnection();
+        if (replacement != null) {
+            synchronized (allConnections) {
+                allConnections.remove(broken);
+                allConnections.add(replacement);
             }
         }
-
-        // All retries failed — pool is now one connection short.
-        // Log prominently so operators notice.
-        System.err.printf(
-                "[ConnectionPool] WARNING: Could not create replacement after %d attempts. " +
-                        "Pool now has %d/%d available connections.%n",
-                REPLACEMENT_RETRY_COUNT, availableConnections.size(), poolSize
-        );
+        return replacement;
     }
 
     // -------------------------------------------------------------------------
-    // Inner class: PoolExhaustedException
+    // toString
     // -------------------------------------------------------------------------
 
-    /**
-     * Thrown when no connection becomes available within the acquire timeout.
-     *
-     * This is a distinct exception from IOException because the cause is different:
-     *   IOException       = network failure
-     *   PoolExhausted     = all connections in use, caller must retry or fail fast
-     *
-     * Callers can catch this specifically to implement retry logic, circuit breaking,
-     * or return a "service unavailable" response to their clients.
-     */
-    public static class PoolExhaustedException extends IOException {
-        public PoolExhaustedException(String message) {
-            super(message);
-        }
+    @Override
+    public String toString() {
+        return String.format(
+                "ConnectionPool{host='%s', port=%d, size=%d, active=%d, idle=%d, closed=%b}",
+                host, port, poolSize, activeCount.get(), availableConnections.size(), closed
+        );
     }
 }
