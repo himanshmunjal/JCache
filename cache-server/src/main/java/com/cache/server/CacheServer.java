@@ -490,7 +490,7 @@ public class CacheServer {
      * We call sync() on the returned futures to wait for full shutdown before
      * this method returns. This prevents resource leaks in tests.
      */
-    private void shutdown() {
+    public void shutdown() {
         if (workerGroup != null) {
             workerGroup.shutdownGracefully().syncUninterruptibly();
         }
