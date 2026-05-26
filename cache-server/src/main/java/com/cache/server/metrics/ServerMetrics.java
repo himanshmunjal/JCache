@@ -70,6 +70,13 @@ public class ServerMetrics {
      * sort in snapshot() to be fast (1000 elements ≈ microseconds).
      */
     private static final int WINDOW_SIZE = 1000;
+    /**
+     * Current number of entries in the cache.
+     * This is a gauge, not a counter — size can increase or decrease.
+     *
+     * Updated by CacheServerHandler after PUT/DELETE operations.
+     */
+    private final AtomicLong cacheSize = new AtomicLong(0);
 
     /**
      * Nanoseconds in one millisecond. Used to convert recorded latencies
@@ -219,6 +226,17 @@ public class ServerMetrics {
         activeConnections.updateAndGet(current -> Math.max(0, current - 1));
     }
 
+    /**
+     * Updates the current cache size gauge.
+     *
+     * Called by CacheServer after mutations (PUT/DELETE/TTL eviction).
+     *
+     * @param size Current number of entries in the cache.
+     */
+    public void updateCacheSize(long size) {
+        cacheSize.set(Math.max(0, size));
+    }
+
     // -------------------------------------------------------------------------
     // Snapshot — called when a client sends STATS
     // -------------------------------------------------------------------------
@@ -240,6 +258,7 @@ public class ServerMetrics {
         long missesVal       = misses.sum();
         long errorsVal       = errors.sum();
         long activeConns     = activeConnections.get();
+        long cacheSizeVal    = cacheSize.get();
         long totalConns      = totalConnections.sum();
         long uptimeMs        = System.currentTimeMillis() - startTimeMs;
 
@@ -263,7 +282,7 @@ public class ServerMetrics {
                 totalGetsVal, totalPutsVal, totalDeletesVal,
                 hitsVal, missesVal, errorsVal,
                 hitRate, opsPerSecond,
-                activeConns, totalConns,
+                activeConns, cacheSizeVal, totalConns,
                 uptimeMs,
                 latency.p50Ms, latency.p99Ms, latency.meanMs
         );
@@ -278,15 +297,35 @@ public class ServerMetrics {
      *   hitRate:78.89% opsPerSec:4250.0 activeConn:3 uptime:42000ms
      *   p50:0.08ms p99:0.31ms mean:0.09ms
      */
-    public String toStatsString() {
+    public String toStatsString(long evictions, int size) {
+
         MetricsSnapshot s = snapshot();
+
         return String.format(
-                "hits:%d misses:%d gets:%d puts:%d deletes:%d errors:%d " +
+                "hits:%d misses:%d evictions:%d size:%d " +
+                        "gets:%d puts:%d deletes:%d errors:%d " +
                         "hitRate:%.2f%% opsPerSec:%.1f activeConn:%d totalConn:%d " +
                         "uptime:%dms p50:%.3fms p99:%.3fms mean:%.3fms",
-                s.hits, s.misses, s.totalGets, s.totalPuts, s.totalDeletes, s.errors,
-                s.hitRate, s.opsPerSecond, s.activeConnections, s.totalConnections,
-                s.uptimeMs, s.p50Ms, s.p99Ms, s.meanMs
+
+                s.hits,
+                s.misses,
+                evictions,
+                size,
+
+                s.totalGets,
+                s.totalPuts,
+                s.totalDeletes,
+                s.errors,
+
+                s.hitRate,
+                s.opsPerSecond,
+                s.activeConnections,
+                s.totalConnections,
+
+                s.uptimeMs,
+                s.p50Ms,
+                s.p99Ms,
+                s.meanMs
         );
     }
 
@@ -407,6 +446,7 @@ public class ServerMetrics {
         public final double hitRate;           // percentage: 0.0 to 100.0
         public final double opsPerSecond;
         public final long   activeConnections;
+        public final long cacheSize;
         public final long   totalConnections;
         public final long   uptimeMs;
         public final double p50Ms;             // median latency in milliseconds
@@ -417,7 +457,7 @@ public class ServerMetrics {
                 long totalGets, long totalPuts, long totalDeletes,
                 long hits, long misses, long errors,
                 double hitRate, double opsPerSecond,
-                long activeConnections, long totalConnections,
+                long activeConnections, long cacheSize, long totalConnections,
                 long uptimeMs,
                 double p50Ms, double p99Ms, double meanMs
         ) {
@@ -430,6 +470,7 @@ public class ServerMetrics {
             this.hitRate          = hitRate;
             this.opsPerSecond     = opsPerSecond;
             this.activeConnections = activeConnections;
+            this.cacheSize         = cacheSize;
             this.totalConnections = totalConnections;
             this.uptimeMs         = uptimeMs;
             this.p50Ms            = p50Ms;
@@ -440,9 +481,13 @@ public class ServerMetrics {
         @Override
         public String toString() {
             return String.format(
-                    "MetricsSnapshot{gets=%d, puts=%d, hits=%d, misses=%d, " +
-                            "hitRate=%.2f%%, opsPerSec=%.1f, p50=%.3fms, p99=%.3fms}",
-                    totalGets, totalPuts, hits, misses, hitRate, opsPerSecond, p50Ms, p99Ms
+                    "hits:%d misses:%d gets:%d puts:%d deletes:%d errors:%d " +
+                            "hitRate:%.2f%% opsPerSec:%.1f activeConn:%d cacheSize:%d totalConn:%d " +
+                            "uptime:%dms p50:%.3fms p99:%.3fms mean:%.3fms",
+                    hits, misses, totalGets, totalPuts, totalDeletes, errors,
+                    hitRate, opsPerSecond,
+                    activeConnections, cacheSize, totalConnections,
+                    uptimeMs, p50Ms, p99Ms, meanMs
             );
         }
     }

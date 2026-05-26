@@ -1,6 +1,7 @@
 package com.cache.server.handler;
 
 import com.cache.api.Cache;
+import com.cache.api.CacheStats;
 import com.cache.server.ServerConfig;
 import com.cache.server.metrics.ServerMetrics;
 import io.netty.channel.ChannelHandlerContext;
@@ -404,7 +405,15 @@ public class CacheServerHandler extends SimpleChannelInboundHandler<String> {
      * @return Formatted stats string prefixed with "+".
      */
     private String handleStats() {
-        return "+" + metrics.toStatsString() + CRLF;
+
+        CacheStats stats = cache.getstats();
+
+        return "+"
+                + metrics.toStatsString(
+                stats.evictions(),
+                cache.size()
+        )
+                + CRLF;
     }
 
     /**
@@ -431,8 +440,7 @@ public class CacheServerHandler extends SimpleChannelInboundHandler<String> {
         // For now, we return OK and log that flush is not fully implemented.
         // In Day 13 cleanup, add clear() to the Cache interface and implement
         // it in LRUCache, LFUCache, ARCCache.
-        System.out.println("[Handler] FLUSH command received — " +
-                "add clear() to Cache interface to implement fully.");
+        cache.clear();
         return OK;
     }
 

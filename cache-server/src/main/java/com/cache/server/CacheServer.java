@@ -7,6 +7,7 @@ import com.cache.policy.LFUCache;
 import com.cache.policy.LRUCache;
 import com.cache.server.handler.CacheServerHandler;
 import com.cache.server.metrics.ServerMetrics;
+import com.cache.ttl.TTLCache;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -469,10 +470,11 @@ public class CacheServer {
                 break;
         }
 
+        delegate = new TTLCache<>(delegate);
         // Wrap with segmented locking — 16 segments is a good default
         // (covers up to 16 concurrent writers with zero contention).
-        return new SegmentedCache<>(capacity, 16);
-
+//        return new SegmentedCache<>(capacity, 16);
+        return delegate;
         // ALTERNATIVE: For maximum throughput in read-heavy workloads:
         // return new LockFreeCache<>(capacity);
         //
