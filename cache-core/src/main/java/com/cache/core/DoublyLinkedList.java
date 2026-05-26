@@ -53,13 +53,22 @@ public class DoublyLinkedList<K, V> {
      * Caller is responsible for ensuring the node is actually in this list.
      * O(1) — no traversal needed because nodes carry their own prev/next.
      */
-    public void remove(Node<K, V> node) {
-        node.prev.next = node.next;
-        node.next.prev = node.prev;
-        // Null out pointers to avoid subtle bugs if the node is reused
+    public void remove(Node<K,V> node) {
+        if (node == null) return;
+
+        Node<K,V> prev = node.prev;
+        Node<K,V> next = node.next;
+
+        if (prev != null) {
+            prev.next = next;
+        }
+
+        if (next != null) {
+            next.prev = prev;
+        }
+
         node.prev = null;
         node.next = null;
-        size--;
     }
 
     /**
@@ -101,6 +110,12 @@ public class DoublyLinkedList<K, V> {
     public void moveToFront(Node<K, V> node) {
         remove(node);
         addToFront(node);
+    }
+
+
+    public void clear() {
+        head.next = tail;
+        tail.prev = head;
     }
 
     public Node<K,V> removeFirst(){
