@@ -6,4 +6,5 @@ public interface Cache <K,V>{
     void evict(K key);
     int size();
     CacheStats getstats();
+    void clear();
 }

@@ -78,6 +78,13 @@ public class LFUCache<K, V> implements Cache<K, V>, EvictionPolicy<K> {
         this.freqMap = new HashMap<>();
     }
 
+    @Override
+    public void clear() {
+        map.clear();
+        freqMap.clear();
+        minFreq = 0;
+    }
+
     // Cache Interface
     /**
      * Returns value for key.

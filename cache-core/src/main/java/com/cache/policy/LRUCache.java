@@ -152,6 +152,12 @@ public class LRUCache<K, V> implements Cache<K, V>, EvictionPolicy<K> {
         }
     }
 
+    @Override
+    public void clear() {
+        map.clear();
+        list.clear();
+    }
+
     /** Called on every new insert — node is already at front, nothing to do. */
     @Override
     public void onInsert(K key) {

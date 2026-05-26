@@ -299,6 +299,18 @@ public class ARCCache<K, V> implements Cache<K, V>, EvictionPolicy<K> {
         // No-op
     }
 
+    @Override
+    public void clear() {
+        t1.clear();
+        t2.clear();
+        b1Ghost.clear();
+        b2Ghost.clear();
+
+        cache.clear();
+
+        p = 0;
+    }
+
     // REPLACEMENT LOGIC
 
     /**
