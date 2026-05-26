@@ -106,6 +106,11 @@ public class TTLCache<K, V> implements Cache<K, V> {
      */
     private final long sweepIntervalMs;
 
+    /**
+     * Global lock protecting delegate cache + expiry metadata consistency.
+     */
+    private final Object ttlLock = new Object();
+
     // Constructors
 
     /**
@@ -180,17 +185,24 @@ public class TTLCache<K, V> implements Cache<K, V> {
      */
     @Override
     public V get(K key) {
-        // Step 1: Check if this key has an expiry entry and if it has passed.
-        // isExpired() is a fast O(1) ConcurrentHashMap lookup.
-        if (isExpired(key)) {
-            // Key is expired — remove from both structures and return null.
-            // This is lazy eviction: we only clean up when someone asks.
-            deleteKey(key);
-            return null;
-        }
+        synchronized (ttlLock) {
 
-        // Step 2: Key is either not expired or has no TTL — delegate to underlying cache.
-        return delegate.get(key);
+            if (isExpired(key)) {
+                deleteKey(key);
+                return null;
+            }
+
+            return delegate.get(key);
+        }
+    }
+
+    @Override
+    public void clear() {
+        synchronized (ttlLock) {
+            expiryMap.clear();
+            delegate.clear();
+            sweepEvictions.set(0);
+        }
     }
 
     /**
@@ -222,28 +234,60 @@ public class TTLCache<K, V> implements Cache<K, V> {
      * @param ttlSeconds Time-to-live in seconds. 0 means no expiry.
      */
     public void put(K key, V value, long ttlSeconds) {
-        if (key == null)   throw new IllegalArgumentException("Key cannot be null");
-        if (value == null) throw new IllegalArgumentException("Value cannot be null");
-        if (ttlSeconds < 0) {
-            throw new IllegalArgumentException(
-                    "TTL cannot be negative, got: " + ttlSeconds
-            );
-        }
+//        if (key == null)   throw new IllegalArgumentException("Key cannot be null");
+//        if (value == null) throw new IllegalArgumentException("Value cannot be null");
+//        if (ttlSeconds < 0) {
+//            throw new IllegalArgumentException(
+//                    "TTL cannot be negative, got: " + ttlSeconds
+//            );
+//        }
+//
+//        // Step 1: Record the expiry deadline BEFORE putting into the delegate.
+//        // Why before? If we put into delegate first and the sweeper runs in
+//        // between, it might not find an expiry entry and leave a zombie key.
+//        expiryMap.remove(key);
+//        if (ttlSeconds == 0) {
+//            // No TTL — sentinel value means "never expires".
+//            expiryMap.put(key, NO_EXPIRY);
+//        } else {
+//            // Compute absolute deadline: current time + TTL in milliseconds.
+//            long expiryTimestamp = System.currentTimeMillis() + (ttlSeconds * 1000L);
+//            expiryMap.put(key, expiryTimestamp);
+//        }
+//
+//        // Step 2: Delegate the actual storage and eviction logic.
+//        delegate.put(key, value);
+        synchronized (ttlLock) {
 
-        // Step 1: Record the expiry deadline BEFORE putting into the delegate.
-        // Why before? If we put into delegate first and the sweeper runs in
-        // between, it might not find an expiry entry and leave a zombie key.
-        if (ttlSeconds == 0) {
-            // No TTL — sentinel value means "never expires".
-            expiryMap.put(key, NO_EXPIRY);
-        } else {
-            // Compute absolute deadline: current time + TTL in milliseconds.
-            long expiryTimestamp = System.currentTimeMillis() + (ttlSeconds * 1000L);
-            expiryMap.put(key, expiryTimestamp);
-        }
+            if (key == null)
+                throw new IllegalArgumentException("Key cannot be null");
 
-        // Step 2: Delegate the actual storage and eviction logic.
-        delegate.put(key, value);
+            if (value == null)
+                throw new IllegalArgumentException("Value cannot be null");
+
+            if (ttlSeconds < 0) {
+                throw new IllegalArgumentException(
+                        "TTL cannot be negative, got: " + ttlSeconds
+                );
+            }
+
+            // Remove stale metadata before overwrite
+            expiryMap.remove(key);
+
+            if (ttlSeconds == 0) {
+
+                expiryMap.put(key, NO_EXPIRY);
+
+            } else {
+
+                long expiryTimestamp =
+                        System.currentTimeMillis() + (ttlSeconds * 1000L);
+
+                expiryMap.put(key, expiryTimestamp);
+            }
+
+            delegate.put(key, value);
+        }
     }
 
     /**
@@ -254,7 +298,9 @@ public class TTLCache<K, V> implements Cache<K, V> {
      */
     @Override
     public void evict(K key) {
-        deleteKey(key);
+        synchronized (ttlLock) {
+            deleteKey(key);
+        }
     }
 
     /**
@@ -302,7 +348,7 @@ public class TTLCache<K, V> implements Cache<K, V> {
         if (deadline == null)         return 0;   // key doesn't exist
         if (deadline == NO_EXPIRY)    return -1;  // permanent key
         long remainingMs = deadline - System.currentTimeMillis();
-        return remainingMs <= 0 ? 0 : remainingMs / 1000L;
+        return remainingMs <= 0 ? 0 : Math.max(1, remainingMs / 1000L);
     }
 
     /**
@@ -367,8 +413,8 @@ public class TTLCache<K, V> implements Cache<K, V> {
      * @param key The key to remove.
      */
     private void deleteKey(K key) {
-        expiryMap.remove(key);
         delegate.evict(key);
+        expiryMap.remove(key);
     }
 
     /**
@@ -385,26 +431,32 @@ public class TTLCache<K, V> implements Cache<K, V> {
      * task suppresses future executions if uncaught.
      */
     private void sweepExpiredKeys() {
-        try {
-            long now = System.currentTimeMillis();
+        synchronized (ttlLock) {
 
-            for (Map.Entry<K, Long> entry : expiryMap.entrySet()) {
-                long deadline = entry.getValue();
+            try {
 
-                // Skip permanent keys and non-expired keys.
-                if (deadline == NO_EXPIRY || now <= deadline) {
-                    continue;
+                long now = System.currentTimeMillis();
+
+                for (Map.Entry<K, Long> entry : expiryMap.entrySet()) {
+
+                    long deadline = entry.getValue();
+
+                    if (deadline == NO_EXPIRY || now <= deadline) {
+                        continue;
+                    }
+
+                    deleteKey(entry.getKey());
+
+                    sweepEvictions.incrementAndGet();
                 }
 
-                // Key has expired — remove it.
-                // We call deleteKey() which removes from both structures.
-                // If lazy eviction already removed it, deleteKey() is a safe no-op.
-                deleteKey(entry.getKey());
-                sweepEvictions.incrementAndGet();
+            } catch (Throwable t) {
+
+                System.err.println(
+                        "[TTLCache] Sweeper encountered an error: "
+                                + t.getMessage()
+                );
             }
-        } catch (Throwable t) {
-            // Log but don't rethrow — rethrowing kills future scheduled executions.
-            System.err.println("[TTLCache] Sweeper encountered an error: " + t.getMessage());
         }
     }
 }
