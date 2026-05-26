@@ -339,6 +339,11 @@ public final class CacheFactory {
          * The timer starts before the delegate call and stops after.
          */
         @Override
+        public void clear() {
+            delegate.clear();
+        }
+
+        @Override
         public V get(K key) {
             long start = metrics.startTimer();
             V value = delegate.get(key);

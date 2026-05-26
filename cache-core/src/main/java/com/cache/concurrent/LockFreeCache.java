@@ -224,6 +224,12 @@ public class LockFreeCache<K, V> implements Cache<K, V> {
         return entry.value;
     }
 
+    @Override
+    public void clear() {
+        map.clear();
+        currentSize.set(0);
+    }
+
     /**
      * Inserts or updates a key-value pair.
      *

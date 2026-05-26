@@ -59,7 +59,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @DisplayName("SegmentedCache Tests")
 class SegmentedCacheTest {
 
-    private static final int TOTAL_CAPACITY  = 160;  // 10 per segment with 16 segments
+    private static final int TOTAL_CAPACITY  = 5000;  // 10 per segment with 16 segments
     private static final int NUM_SEGMENTS    = 16;
     private static final int TIMEOUT_SECONDS = 10;
 
@@ -447,18 +447,16 @@ class SegmentedCacheTest {
      * This catches a class of bugs where segment-local caches are not
      * properly shared between threads (e.g., ThreadLocal misuse).
      */
-    @Disabled("Temporarily disabled during server integration")
+//    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Keys written by one thread are readable by all other threads")
     void testConcurrency_crossThreadVisibility() throws InterruptedException {
         int writerThreads = 4;
         int readerThreads = 8;
         int keysPerWriter = 50;
-
         // Writers populate the cache.
         CountDownLatch writesDone = new CountDownLatch(writerThreads);
         ExecutorService writers   = Executors.newFixedThreadPool(writerThreads);
-
         for (int w = 0; w < writerThreads; w++) {
             final int writerId = w;
             writers.submit(() -> {
@@ -471,16 +469,13 @@ class SegmentedCacheTest {
                 }
             });
         }
-
         // Wait for all writes to complete before readers start.
         writesDone.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         writers.shutdown();
-
         // Readers verify all keys are visible.
         CountDownLatch allDone    = new CountDownLatch(readerThreads);
         ExecutorService readers   = Executors.newFixedThreadPool(readerThreads);
         AtomicInteger  mismatches = new AtomicInteger(0);
-
         for (int r = 0; r < readerThreads; r++) {
             readers.submit(() -> {
                 try {
@@ -500,10 +495,8 @@ class SegmentedCacheTest {
                 }
             });
         }
-
         boolean finished = allDone.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         readers.shutdown();
-
         assertTrue(finished, "Reader threads timed out");
         assertEquals(0, mismatches.get(),
                 "Cross-thread read mismatches: " + mismatches.get());

@@ -1,6 +1,7 @@
 package com.cache.ttl;
 
 import com.cache.api.Cache;
+import com.cache.concurrent.SegmentedCache;
 import com.cache.policy.LRUCache;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.parallel.Execution;
@@ -60,8 +61,8 @@ class TTLCacheTest {
      */
     @BeforeEach
     void setUp() {
-        Cache<String, String> lruDelegate = new LRUCache<>(10);
-        cache = new TTLCache<>(lruDelegate, SWEEP_INTERVAL_MS);
+        Cache<String, String> lruDelegate = new SegmentedCache<>(100);
+        cache = new TTLCache<>(new SegmentedCache<>(100), SWEEP_INTERVAL_MS);
     }
 
     /**
@@ -498,7 +499,7 @@ class TTLCacheTest {
      * no data corruption. Tests that ConcurrentHashMap in expiryMap
      * and the delegate's own locking cooperate correctly.
      */
-    @Disabled("Temporarily disabled during server integration")
+//    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Concurrent puts from multiple threads do not corrupt state")
     void testConcurrency_concurrentPuts() throws InterruptedException {
@@ -507,9 +508,7 @@ class TTLCacheTest {
         CountDownLatch start = new CountDownLatch(1);
         CountDownLatch done  = new CountDownLatch(threadCount);
         AtomicInteger errors = new AtomicInteger(0);
-
         ExecutorService pool = Executors.newFixedThreadPool(threadCount);
-
         for (int t = 0; t < threadCount; t++) {
             final int threadId = t;
             pool.submit(() -> {
@@ -526,11 +525,9 @@ class TTLCacheTest {
                 }
             });
         }
-
         start.countDown(); // release all threads
         done.await(10, TimeUnit.SECONDS);
         pool.shutdown();
-
         assertEquals(0, errors.get(), "No errors should occur under concurrent puts");
     }
 
@@ -538,7 +535,7 @@ class TTLCacheTest {
      * Mixed concurrent reads and writes — verifies no stale/wrong values
      * are returned and no exceptions are thrown.
      */
-    @Disabled("Temporarily disabled during server integration")
+//    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Concurrent gets and puts do not produce exceptions")
     void testConcurrency_mixedGetsPuts() throws InterruptedException {
@@ -546,14 +543,11 @@ class TTLCacheTest {
         for (int i = 0; i < 20; i++) {
             cache.put("key-" + i, "val-" + i, 5);
         }
-
         int threadCount = 10;
         CountDownLatch start = new CountDownLatch(1);
         CountDownLatch done  = new CountDownLatch(threadCount);
         AtomicInteger errors = new AtomicInteger(0);
-
         ExecutorService pool = Executors.newFixedThreadPool(threadCount);
-
         for (int t = 0; t < threadCount; t++) {
             final int threadId = t;
             pool.submit(() -> {
@@ -573,11 +567,9 @@ class TTLCacheTest {
                 }
             });
         }
-
         start.countDown();
         done.await(10, TimeUnit.SECONDS);
         pool.shutdown();
-
         assertEquals(0, errors.get(), "No exceptions should occur under concurrent mixed load");
     }
 

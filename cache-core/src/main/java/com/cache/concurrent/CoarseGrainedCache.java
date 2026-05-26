@@ -4,7 +4,7 @@ import com.cache.api.Cache;
 import com.cache.api.CacheStats;
 
 import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * CoarseGrainedCache — Thread-safe cache using a single ReadWriteLock.
@@ -68,6 +68,8 @@ public class CoarseGrainedCache<K, V> implements Cache<K, V> {
      */
     private final Cache<K, V> delegate;
 
+    private final ReentrantLock lock = new ReentrantLock();
+
     /**
      * The single lock guarding the entire cache.
      *
@@ -80,7 +82,7 @@ public class CoarseGrainedCache<K, V> implements Cache<K, V> {
      *     can't indefinitely block a waiting writer.
      *     Trade-off: slightly lower throughput than unfair mode.
      */
-    private final ReadWriteLock lock = new ReentrantReadWriteLock(true /* fair */);
+//    private final ReadWriteLock lock = new ReentrantReadWriteLock(true /* fair */);
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -123,11 +125,11 @@ public class CoarseGrainedCache<K, V> implements Cache<K, V> {
      */
     @Override
     public V get(K key) {
-        lock.readLock().lock();
+        lock.lock();
         try {
             return delegate.get(key);
         } finally {
-            lock.readLock().unlock(); // ALWAYS releases, even on exception
+            lock.unlock(); // ALWAYS releases, even on exception
         }
     }
 
@@ -147,11 +149,11 @@ public class CoarseGrainedCache<K, V> implements Cache<K, V> {
      */
     @Override
     public void put(K key, V value) {
-        lock.writeLock().lock();
+        lock.lock();
         try {
             delegate.put(key, value);
         } finally {
-            lock.writeLock().unlock();
+            lock.unlock();
         }
     }
 
@@ -164,11 +166,11 @@ public class CoarseGrainedCache<K, V> implements Cache<K, V> {
      */
     @Override
     public void evict(K key) {
-        lock.writeLock().lock();
+        lock.lock();
         try {
             delegate.evict(key);
         } finally {
-            lock.writeLock().unlock();
+            lock.unlock();
         }
     }
 
@@ -186,11 +188,22 @@ public class CoarseGrainedCache<K, V> implements Cache<K, V> {
      */
     @Override
     public int size() {
-        lock.readLock().lock();
+        lock.lock();
         try {
             return delegate.size();
         } finally {
-            lock.readLock().unlock();
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public void clear() {
+        lock.lock();
+
+        try {
+            delegate.clear();
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -206,11 +219,11 @@ public class CoarseGrainedCache<K, V> implements Cache<K, V> {
      */
     @Override
     public CacheStats getstats() {
-        lock.readLock().lock();
+        lock.lock();
         try {
             return delegate.getstats();
         } finally {
-            lock.readLock().unlock();
+            lock.unlock();
         }
     }
 
@@ -225,15 +238,15 @@ public class CoarseGrainedCache<K, V> implements Cache<K, V> {
      * Casting to ReentrantReadWriteLock gives access to diagnostic methods
      * not on the ReadWriteLock interface.
      */
-    public boolean isWriteLocked() {
-        return ((ReentrantReadWriteLock) lock).isWriteLocked();
-    }
-
-    /**
-     * Returns the number of threads currently waiting to acquire any lock.
-     * Useful for detecting contention in benchmark analysis.
-     */
-    public int getQueueLength() {
-        return ((ReentrantReadWriteLock) lock).getQueueLength();
-    }
+//    public boolean isWriteLocked() {
+//        return ((ReentrantReadWriteLock) lock).isWriteLocked();
+//    }
+//
+//    /**
+//     * Returns the number of threads currently waiting to acquire any lock.
+//     * Useful for detecting contention in benchmark analysis.
+//     */
+//    public int getQueueLength() {
+//        return ((ReentrantReadWriteLock) lock).getQueueLength();
+//    }
 }

@@ -164,7 +164,7 @@ class CoarseGrainedCacheTest {
      * is broken (e.g., no lock at all), a concurrent write during
      * LinkedList traversal in LRUCache would cause ConcurrentModificationException.
      */
-    @Disabled("Temporarily disabled during server integration")
+//    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Concurrent readers all see correct values — no corruption")
     void testConcurrentReads_noCorruption() throws InterruptedException {
@@ -172,13 +172,10 @@ class CoarseGrainedCacheTest {
         for (int i = 0; i < 50; i++) {
             cache.put("stable-" + i, "value-" + i);
         }
-
         CountDownLatch startGun = new CountDownLatch(1);   // all threads wait here
         CountDownLatch allDone  = new CountDownLatch(READ_THREADS);
         AtomicInteger errors    = new AtomicInteger(0);
-
         ExecutorService pool = Executors.newFixedThreadPool(READ_THREADS);
-
         for (int t = 0; t < READ_THREADS; t++) {
             pool.submit(() -> {
                 try {
@@ -198,12 +195,9 @@ class CoarseGrainedCacheTest {
                 }
             });
         }
-
         startGun.countDown(); // RELEASE — all threads start simultaneously
         boolean finished = allDone.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
         pool.shutdown();
-
         assertTrue(finished, "Test timed out — possible deadlock");
         assertEquals(0, errors.get(),
                 "Concurrent readers saw incorrect values: " + errors.get() + " errors");
@@ -321,7 +315,7 @@ class CoarseGrainedCacheTest {
      * Primary assertion: no exceptions thrown.
      * Secondary assertion: reads never return a value that was never written.
      */
-    @Disabled("Temporarily disabled during server integration")
+//    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Mixed concurrent reads and writes — no exceptions, no corruption")
     void testMixedReadWrite_noExceptions() throws InterruptedException {
@@ -329,13 +323,10 @@ class CoarseGrainedCacheTest {
         for (int i = 0; i < 20; i++) {
             cache.put("base-" + i, "val-" + i);
         }
-
         CountDownLatch startGun = new CountDownLatch(1);
         CountDownLatch allDone  = new CountDownLatch(MIXED_THREADS);
         AtomicInteger  errors   = new AtomicInteger(0);
-
         ExecutorService pool = Executors.newFixedThreadPool(MIXED_THREADS);
-
         for (int t = 0; t < MIXED_THREADS; t++) {
             final int threadId = t;
             pool.submit(() -> {
@@ -358,11 +349,9 @@ class CoarseGrainedCacheTest {
                 }
             });
         }
-
         startGun.countDown();
         boolean finished = allDone.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         pool.shutdown();
-
         assertTrue(finished, "Test timed out — possible deadlock");
         assertEquals(0, errors.get(),
                 "Exceptions during mixed load: " + errors.get());
