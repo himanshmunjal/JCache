@@ -6,6 +6,7 @@ import com.cache.policy.LFUCache;
 import com.cache.policy.LRUCache;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
+import org.openjdk.jmh.results.format.ResultFormatType;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
@@ -312,9 +313,8 @@ public class PolicyComparisonBenchmark {
                 .forks(1)
                 .warmupIterations(2)
                 .measurementIterations(3)
-                // Uncomment to generate JSON for charting:
-                // .resultFormat(ResultFormatType.JSON)
-                // .result("policy-comparison-results.json")
+                 .resultFormat(ResultFormatType.JSON)
+                 .result("policy-comparison-results.json")
                 .build();
 
         new Runner(opt).run();
