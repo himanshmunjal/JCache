@@ -1,7 +1,5 @@
-package com.cache.commom.cluster;
+package com.cache.common.cluster;
 
-import com.cache.common.cluster.CacheNode;
-import com.cache.common.cluster.ConsistentHashRing;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
