@@ -42,7 +42,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *   This is correct — we want threads to contend on the same cache, not
  *   each have their own private copy (that would defeat the concurrency test).
  */
-@BenchmarkMode({Mode.Throughput, Mode.AverageTime})
+@BenchmarkMode({
+        Mode.Throughput,
+        Mode.AverageTime
+})
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Benchmark)
 @Fork(value = 2, jvmArgs = {"-Xms512m", "-Xmx512m"})
@@ -235,6 +238,18 @@ public class LRUBenchmark {
         } else {
             bh.consume(lruCache.get(key));
         }
+    }
+
+    @Benchmark
+    @BenchmarkMode(Mode.SampleTime)
+    @OutputTimeUnit(TimeUnit.MICROSECONDS)
+    public String latency_get_zipfian() {
+        String key =
+                workload.zipfianKeys[
+                        (int)(opCounter.getAndIncrement()
+                                % BenchmarkWorkload.WORKLOAD_SIZE)];
+
+        return lruCache.get(key);
     }
 
     // -------------------------------------------------------------------------

@@ -57,12 +57,15 @@ import java.util.concurrent.atomic.AtomicLong;
  *   We add a benchmark that shifts access patterns mid-run to show ARC's
  *   adaptation advantage. This benchmark doesn't have a LRU/LFU equivalent.
  */
-@BenchmarkMode({Mode.Throughput, Mode.AverageTime})
-@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@BenchmarkMode({
+        Mode.Throughput,
+        Mode.AverageTime
+})
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
 @State(Scope.Benchmark)
 @Fork(value = 2, jvmArgs = {"-Xms512m", "-Xmx512m"})
-@Warmup(iterations = 3, time = 1, timeUnit = TimeUnit.SECONDS)
-@Measurement(iterations = 5, time = 2, timeUnit = TimeUnit.SECONDS)
+@Warmup(iterations = 5, time = 2, timeUnit = TimeUnit.SECONDS)
+@Measurement(iterations = 10, time = 5, timeUnit = TimeUnit.SECONDS)
 public class ARCBenchmark {
 
     // -------------------------------------------------------------------------
@@ -276,6 +279,18 @@ public class ARCBenchmark {
         } else {
             bh.consume(arcCache.get(key));
         }
+    }
+
+    @Benchmark
+    @BenchmarkMode(Mode.SampleTime)
+    @OutputTimeUnit(TimeUnit.MICROSECONDS)
+    public String latency_get_zipfian() {
+        String key =
+                workload.zipfianKeys[
+                        (int)(opCounter.getAndIncrement()
+                                % BenchmarkWorkload.WORKLOAD_SIZE)];
+
+        return arcCache.get(key);
     }
 
     // -------------------------------------------------------------------------

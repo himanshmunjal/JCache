@@ -42,12 +42,15 @@ import java.util.concurrent.atomic.AtomicLong;
  *   Consistent across all policy benchmarks so numbers are comparable.
  *   Never compare benchmarks with different fork/warmup/measurement settings.
  */
-@BenchmarkMode({Mode.Throughput, Mode.AverageTime})
-@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@BenchmarkMode({
+        Mode.Throughput,
+        Mode.AverageTime
+})
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
 @State(Scope.Benchmark)
 @Fork(value = 2, jvmArgs = {"-Xms512m", "-Xmx512m"})
-@Warmup(iterations = 3, time = 1, timeUnit = TimeUnit.SECONDS)
-@Measurement(iterations = 5, time = 2, timeUnit = TimeUnit.SECONDS)
+@Warmup(iterations = 5, time = 2, timeUnit = TimeUnit.SECONDS)
+@Measurement(iterations = 10, time = 5, timeUnit = TimeUnit.SECONDS)
 public class LFUBenchmark {
 
     // -------------------------------------------------------------------------
@@ -224,6 +227,18 @@ public class LFUBenchmark {
         long idx   = opCounter.getAndIncrement();
         String key = "key-" + (idx % BenchmarkWorkload.KEY_SPACE_SIZE);
         bh.consume(lfuCache.get(key));
+    }
+
+    @Benchmark
+    @BenchmarkMode(Mode.SampleTime)
+    @OutputTimeUnit(TimeUnit.MICROSECONDS)
+    public String latency_get_zipfian() {
+        String key =
+                workload.zipfianKeys[
+                        (int)(opCounter.getAndIncrement()
+                                % BenchmarkWorkload.WORKLOAD_SIZE)];
+
+        return lfuCache.get(key);
     }
 
     // -------------------------------------------------------------------------
