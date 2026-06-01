@@ -87,8 +87,11 @@ import java.util.concurrent.atomic.AtomicLong;
  *   you're measuring context-switching overhead, not locking strategy.
  *   The interesting scaling behavior happens between 1 and 2x physical core count.
  */
-@BenchmarkMode({Mode.Throughput, Mode.AverageTime})
-@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@BenchmarkMode({
+        Mode.Throughput,
+        Mode.AverageTime
+})
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
 @State(Scope.Benchmark)
 @Fork(value = 2, jvmArgs = {
         "-Xms512m", "-Xmx512m",
@@ -97,8 +100,8 @@ import java.util.concurrent.atomic.AtomicLong;
         // We want clean numbers that reflect true concurrent behavior.
         "-XX:-UseBiasedLocking"
 })
-@Warmup(iterations = 3, time = 1, timeUnit = TimeUnit.SECONDS)
-@Measurement(iterations = 5, time = 2, timeUnit = TimeUnit.SECONDS)
+@Warmup(iterations = 5, time = 2, timeUnit = TimeUnit.SECONDS)
+@Measurement(iterations = 10, time = 5, timeUnit = TimeUnit.SECONDS)
 public class ConcurrencyBenchmark {
 
     // -------------------------------------------------------------------------
@@ -233,7 +236,7 @@ public class ConcurrencyBenchmark {
      * @param bh Blackhole prevents JIT from eliminating the get() call.
      */
     @Benchmark
-    @Threads(1) // JMH override: actual thread count set by @Param threadCount via Group
+    @Threads(32) // JMH override: actual thread count set by @Param threadCount via Group
     public void read_heavy_zipfian(Blackhole bh) {
         long idx   = opCounter.getAndIncrement();
         String key = workload.zipfianKeys[(int)(idx % BenchmarkWorkload.WORKLOAD_SIZE)];
@@ -378,9 +381,9 @@ public class ConcurrencyBenchmark {
                 .forks(1)
                 .warmupIterations(2)
                 .measurementIterations(3)
-                // For quick local testing, restrict to fewer params:
-                // .param("strategy", "COARSE", "LOCKFREE")
-                // .param("threadCount", "1", "8", "32")
+//                 For quick local testing, restrict to fewer params:
+                .param("strategy", "COARSE", "SEGMENTED", "LOCKFREE")
+                 .param("threadCount", "1", "4", "8", "16","32")
                 .build();
 
         new Runner(opt).run();
