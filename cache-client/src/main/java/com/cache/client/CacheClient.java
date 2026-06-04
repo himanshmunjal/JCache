@@ -474,10 +474,7 @@ public class CacheClient implements Closeable {
      */
     private void ensureConnected() throws IOException {
         if (!isConnected()) {
-            throw new IOException(
-                    "CacheClient is not connected to " + host + ":" + port +
-                            ". Call connect() to reconnect."
-            );
+            throw new IOException("CacheClient is not connected to " + host + ":" + port + ". Call connect() to reconnect.");
         }
     }
 
@@ -493,9 +490,7 @@ public class CacheClient implements Closeable {
             throw new IllegalArgumentException("Key cannot be null or empty");
         }
         if (key.contains(" ")) {
-            throw new IllegalArgumentException(
-                    "Key cannot contain spaces (wire protocol uses space as delimiter): '" + key + "'"
-            );
+            throw new IllegalArgumentException("Key cannot contain spaces (wire protocol uses space as delimiter): '" + key + "'");
         }
         if (key.contains("\n") || key.contains("\r")) {
             throw new IllegalArgumentException("Key cannot contain newline characters");

@@ -404,8 +404,7 @@ class CacheClientTest {
 
             String result = client.get("large-key");
 
-            assertEquals(largeValue, result,
-                    "Large value should survive put/get round-trip intact");
+            assertEquals(largeValue, result, "Large value should survive put/get round-trip intact");
         }
     }
 
