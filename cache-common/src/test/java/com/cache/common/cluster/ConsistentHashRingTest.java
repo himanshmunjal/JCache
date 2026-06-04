@@ -488,7 +488,7 @@ class ConsistentHashRingTest {
         assertThrows(IllegalArgumentException.class, () -> ring.getNode(null));
     }
 
-    @Disabled("Test disable tmp")
+//    @Disabled("Test disable tmp")
     @Test
     @DisplayName("removeNode() on nonexistent node is a safe no-op")
     void testRemoveNonexistent_isNoOp() {

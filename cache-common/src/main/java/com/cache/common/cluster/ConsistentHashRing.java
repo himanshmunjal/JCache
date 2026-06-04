@@ -275,9 +275,8 @@ public class ConsistentHashRing {
         lock.writeLock().lock();
         try {
             if (!nodeById.containsKey(node.getId())) {
-                throw new NoSuchElementException(
-                        "Node not found in ring: " + node.getId()
-                );
+//                throw new NoSuchElementException("Node not found in ring: " + node.getId());
+                return;
             }
             removeNodeInternal(node.getId());
         } finally {
