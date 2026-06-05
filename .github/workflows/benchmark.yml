@@ -1,0 +1,297 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# JCache Benchmark Pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Runs JMH benchmarks on every push to main and on manual trigger.
+# Produces JSON results, posts a summary table to GitHub Actions UI,
+# and checks for performance regressions vs the last baseline.
+#
+# WHY SEPARATE FROM ci.yml?
+#   Benchmarks are slow (5-10 min) and should not block PRs.
+#   A slow benchmark does not mean broken code.
+#   Running only on main gives a stable history for trend analysis.
+
+name: Benchmarks
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      forks:
+        description: 'JMH forks (1=fast, 2=accurate)'
+        required: false
+        default: '2'
+      warmup_iterations:
+        description: 'Warmup iterations'
+        required: false
+        default: '3'
+      measurement_iterations:
+        description: 'Measurement iterations'
+        required: false
+        default: '5'
+      benchmark_filter:
+        description: 'Benchmark filter regex (e.g. LRUBenchmark)'
+        required: false
+        default: '.*'
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: Build the benchmark fat JAR
+  # ─────────────────────────────────────────────────────────────────────────
+  build-benchmarks:
+    name: Build Benchmark JAR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Build benchmark JAR
+        run: |
+          mvn package \
+            --no-transfer-progress \
+            -pl cache-benchmark \
+            -am \
+            -DskipTests
+
+      - name: Verify benchmark JAR exists
+        run: |
+          JAR="cache-benchmark/target/benchmarks.jar"
+          if [ ! -f "$JAR" ]; then
+            echo "benchmarks.jar not found — checking for shaded JAR..."
+            JAR=$(find cache-benchmark/target -name "*-shaded.jar" | head -1)
+          fi
+          if [ -z "$JAR" ] || [ ! -f "$JAR" ]; then
+            echo "ERROR: No benchmark JAR found in cache-benchmark/target/"
+            ls cache-benchmark/target/ || true
+            exit 1
+          fi
+          echo "Found JAR: $JAR ($(du -sh $JAR | cut -f1))"
+
+      - name: Upload benchmark JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-jar
+          path: cache-benchmark/target/benchmarks.jar
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2: Run the benchmarks
+  # ─────────────────────────────────────────────────────────────────────────
+  run-benchmarks:
+    name: Run JMH Benchmarks
+    runs-on: ubuntu-latest
+    needs: build-benchmarks
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Download benchmark JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-jar
+          path: benchmark-jar/
+
+      - name: Set benchmark parameters
+        run: |
+          echo "FORKS=${{ github.event.inputs.forks || '2' }}"             >> $GITHUB_ENV
+          echo "WI=${{ github.event.inputs.warmup_iterations || '3' }}"   >> $GITHUB_ENV
+          echo "MI=${{ github.event.inputs.measurement_iterations || '5' }}" >> $GITHUB_ENV
+          echo "FILTER=${{ github.event.inputs.benchmark_filter || '.*' }}" >> $GITHUB_ENV
+
+      # Run all benchmarks.
+      # -f  : forks (separate JVM processes, eliminates JIT warm-up bias)
+      # -wi : warmup iterations
+      # -i  : measurement iterations
+      # -w  : warmup time per iteration
+      # -r  : measurement time per iteration
+      # -rf : result format (json for machine parsing)
+      # -rff: result file name
+      # -tu : time unit for output
+      # tee : copy stdout to file AND show in Actions log simultaneously
+      - name: Run JMH benchmarks
+        run: |
+          java \
+            -server \
+            -Xms512m \
+            -Xmx512m \
+            -XX:+UseG1GC \
+            -XX:MaxGCPauseMillis=10 \
+            -jar benchmark-jar/benchmarks.jar \
+            "${{ env.FILTER }}" \
+            -f  ${{ env.FORKS }} \
+            -wi ${{ env.WI }} \
+            -i  ${{ env.MI }} \
+            -w  2s \
+            -r  3s \
+            -rf json \
+            -rff benchmark-results.json \
+            -tu ms \
+          | tee benchmark-stdout.txt
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            benchmark-results.json
+            benchmark-stdout.txt
+          retention-days: 90
+
+      # Write a Markdown summary table to the GitHub Actions UI.
+      # The Python script is written to a temp file first, then executed.
+      # This avoids embedding Python inside YAML which confuses YAML parsers.
+      - name: Write summary script
+        if: always()
+        run: |
+          cat > /tmp/summarize.py << 'EOF'
+          import json, os, sys
+
+          results_path = "benchmark-results.json"
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+
+          lines = []
+          lines.append("## JMH Benchmark Results\n")
+          lines.append(f"**Commit**: `{os.environ.get('GITHUB_SHA', 'unknown')}`\n")
+          lines.append(f"**Runner**: ubuntu-latest\n")
+          lines.append("")
+          lines.append("| Benchmark | Mode | Score | Unit |")
+          lines.append("|-----------|------|-------|------|")
+
+          if not os.path.exists(results_path):
+              lines.append("| ⚠️ No results file found | — | — | — |")
+          else:
+              with open(results_path) as f:
+                  results = json.load(f)
+              for r in results:
+                  name  = r.get("benchmark", "").split(".")[-1]
+                  mode  = r.get("mode", "")
+                  score = r.get("primaryMetric", {}).get("score", 0)
+                  unit  = r.get("primaryMetric", {}).get("scoreUnit", "")
+                  lines.append(f"| {name} | {mode} | {score:.3f} | {unit} |")
+
+          with open(summary_path, "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          print(f"Summary written ({len(lines)} lines)")
+          EOF
+
+      - name: Post benchmark summary
+        if: always()
+        run: python3 /tmp/summarize.py
+
+      # Append last 50 lines of JMH stdout to the summary for quick inspection.
+      - name: Append raw JMH output to summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Raw JMH Output (last 50 lines)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -50 benchmark-stdout.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null \
+            || echo "(benchmark-stdout.txt not found)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # Regression check: compare current results against stored baseline.
+      # The baseline is the benchmark-results.json from the last main push.
+      # Written to /tmp/ to keep it out of the YAML flow entirely.
+      - name: Write regression check script
+        if: always()
+        run: |
+          cat > /tmp/check_regression.py << 'EOF'
+          import json, os, sys
+
+          REGRESSION_THRESHOLD = 0.20
+
+          current_path  = "benchmark-results.json"
+          baseline_path = "benchmark-baseline.json"
+
+          if not os.path.exists(current_path):
+              print("No current results — skipping regression check.")
+              sys.exit(0)
+
+          with open(current_path) as f:
+              current_data = json.load(f)
+          current = {r["benchmark"]: r["primaryMetric"]["score"] for r in current_data}
+
+          if not os.path.exists(baseline_path):
+              print("No baseline found — this run will become the baseline.")
+              sys.exit(0)
+
+          with open(baseline_path) as f:
+              baseline_data = json.load(f)
+          baseline = {r["benchmark"]: r["primaryMetric"]["score"] for r in baseline_data}
+
+          regressions = []
+          for name, score in current.items():
+              short = name.split(".")[-1]
+              if name not in baseline or baseline[name] == 0:
+                  print(f"  NEW:  {short} = {score:.3f} (no baseline)")
+                  continue
+              base  = baseline[name]
+              delta = (score - base) / base
+              if delta > REGRESSION_THRESHOLD:
+                  regressions.append(f"  REGRESSION: {short}: {base:.3f} -> {score:.3f} ({delta*100:+.1f}%)")
+              else:
+                  print(f"  OK:   {short}: {base:.3f} -> {score:.3f} ({delta*100:+.1f}%)")
+
+          if regressions:
+              print("\nPERFORMANCE REGRESSIONS DETECTED (> 20% slower):")
+              for r in regressions:
+                  print(r)
+              # Change sys.exit(1) to fail the build on regression.
+              # Left as sys.exit(0) because CI runners have performance variance.
+              sys.exit(0)
+          else:
+              print("\nNo regressions detected.")
+          EOF
+
+      # Try to download the stored baseline. If it does not exist (first run),
+      # the download step simply produces no file and the script handles that.
+      - name: Download stored baseline
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-baseline
+          path: .
+
+      - name: Check for performance regression
+        if: always()
+        run: python3 /tmp/check_regression.py
+
+      # Save the current results as the new baseline for next time.
+      # Only on main — don't update baseline from manual workflow_dispatch runs
+      # triggered on non-main branches.
+      - name: Save results as new baseline
+        if: github.ref == 'refs/heads/main' && hashFiles('benchmark-results.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline
+          path: benchmark-results.json
+          retention-days: 90
+          overwrite: true
