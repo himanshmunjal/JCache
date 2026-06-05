@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static com.cache.api.CachePolicyType.LRU;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -82,7 +83,7 @@ class ServerIntegrationTest {
     static void startServer() throws Exception {
         ServerConfig config = ServerConfig.builder()
                 .port(TEST_PORT)
-                .evictionPolicy("LRU")
+                .evictionPolicy(LRU)
                 .cacheCapacity(1000)
                 .workerThreads(4)        // fewer threads for predictable test behavior
                 .maxConnections(100)
@@ -110,7 +111,7 @@ class ServerIntegrationTest {
             client.close();
         }
         if (server != null) {
-            server.stop();
+            server.shutdown();
         }
     }
 
@@ -497,7 +498,7 @@ class ServerIntegrationTest {
         int threadCount = 20;
         int opsPerThread = 50;
 
-        ConnectionPool pool = new ConnectionPool("localhost", TEST_PORT, poolSize, 10_000);
+        ConnectionPool pool = new ConnectionPool("localhost", TEST_PORT, poolSize);
 
         CountDownLatch allReady = new CountDownLatch(threadCount);
         CountDownLatch allDone  = new CountDownLatch(threadCount);
@@ -517,7 +518,7 @@ class ServerIntegrationTest {
                         CacheClient conn = pool.acquire();
 
                         // Track peak concurrent active connections
-                        int active = pool.activeCount();
+                        int active = pool.getActiveCount();
                         maxActive.updateAndGet(current -> Math.max(current, active));
 
                         try {
