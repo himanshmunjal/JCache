@@ -4,6 +4,7 @@ import com.cache.client.CacheClient;
 import com.cache.client.ConnectionPool;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
+import org.openjdk.jmh.results.format.ResultFormatType;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
@@ -582,7 +583,9 @@ public class NetworkBenchmark {
                 .forks(1)
                 .warmupIterations(1)
                 .measurementIterations(2)
-                .param("poolSize", "4", "8") // quick test of two pool sizes
+                .param("poolSize", "4", "8")
+                .resultFormat(ResultFormatType.JSON)
+                .result("network-results.json") // quick test of two pool sizes
                 .build();
 
         new Runner(opt).run();
