@@ -18,14 +18,17 @@
         <dependency>
             <groupId>com.cache</groupId>
             <artifactId>cache-server</artifactId>  <!-- boots the real server -->
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>com.cache</groupId>
             <artifactId>cache-client</artifactId>  <!-- connects to it -->
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>com.cache</groupId>
             <artifactId>cache-common</artifactId>  <!-- shared types -->
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
@@ -43,6 +46,7 @@
         <dependency>
             <groupId>com.cache</groupId>
             <artifactId>cache-client</artifactId>
+            <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

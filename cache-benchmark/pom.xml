@@ -15,8 +15,6 @@
     <artifactId>cache-benchmarks</artifactId>
 
     <dependencies>
-
-        <!-- Cache engine being benchmarked -->
         <dependency>
             <groupId>com.cache</groupId>
             <artifactId>cache-core</artifactId>
@@ -26,7 +24,6 @@
             <artifactId>jmh-core</artifactId>
             <version>1.37</version>
         </dependency>
-
         <dependency>
             <groupId>org.openjdk.jmh</groupId>
             <artifactId>jmh-generator-annprocess</artifactId>
@@ -40,6 +37,11 @@
         <dependency>
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.cache</groupId>
+            <artifactId>cache-client</artifactId>
+            <version>${project.version}</version>
         </dependency>
 
     </dependencies>

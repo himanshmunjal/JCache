@@ -18,6 +18,7 @@
         <dependency>
             <groupId>com.cache</groupId>
             <artifactId>cache-common</artifactId>
+            <version>${project.version}</version>
         </dependency>
         <!-- cache-core NOT needed here — client doesn't run the cache engine -->
         <dependency>
