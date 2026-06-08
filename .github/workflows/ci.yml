@@ -1,306 +1,381 @@
-# ═══════════════════════════════════════════════════════════════════════════
-# JCache CI Pipeline
-# ═══════════════════════════════════════════════════════════════════════════
+## ═══════════════════════════════════════════════════════════════════════════
+## JCache CI Pipeline
+## ═══════════════════════════════════════════════════════════════════════════
+##
+## WHAT THIS DOES:
+##   Runs on every push and pull request.
+##   Builds all 6 modules in dependency order.
+##   Runs all unit tests with JaCoCo coverage.
+##   Fails the build if coverage drops below 80%.
+##   Uploads coverage report as a downloadable artifact.
+##
+## MODULE BUILD ORDER (Maven resolves automatically via dependency graph):
+##   cache-common → cache-core → cache-server
+##                             → cache-client
+##                             → cache-benchmark
+##                             → cache-integration-test
+##
+## WHY TWO JOBS (build + coverage)?
+##   Separating them makes the GitHub UI clearer:
+##   - "build" badge = compilation + tests passing
+##   - "coverage" badge = quality gate passing
+##   A failing coverage check doesn't hide a passing build.
+##
+## CACHING STRATEGY:
+##   We cache ~/.m2/repository keyed on the hash of all pom.xml files.
+##   When any pom.xml changes (new dependency added), the cache is invalidated
+##   and dependencies are re-downloaded. On subsequent pushes with the same
+##   pom.xml files, dependencies are served from cache (~30s saved per run).
+##
+## INTERVIEW TALKING POINT:
+##   "Every PR triggers CI — the build fails if any test fails or if coverage
+##    drops below 80%. I used JaCoCo for coverage and uploaded the HTML report
+##    as a GitHub artifact so reviewers can inspect which lines aren't covered."
 #
-# WHAT THIS DOES:
-#   Runs on every push and pull request.
-#   Builds all 6 modules in dependency order.
-#   Runs all unit tests with JaCoCo coverage.
-#   Fails the build if coverage drops below 80%.
-#   Uploads coverage report as a downloadable artifact.
+#name: CI
 #
-# MODULE BUILD ORDER (Maven resolves automatically via dependency graph):
-#   cache-common → cache-core → cache-server
-#                             → cache-client
-#                             → cache-benchmark
-#                             → cache-integration-test
+#on:
+#  push:
+#    branches:
+#      - main
+#      - develop
+#      - 'feature/**'
+#      - 'fix/**'
+#  pull_request:
+#    branches:
+#      - main
+#      - develop
 #
-# WHY TWO JOBS (build + coverage)?
-#   Separating them makes the GitHub UI clearer:
-#   - "build" badge = compilation + tests passing
-#   - "coverage" badge = quality gate passing
-#   A failing coverage check doesn't hide a passing build.
+## Cancel in-progress runs for the same branch when a new push arrives.
+## Saves CI minutes — no point finishing a run that's already outdated.
+#concurrency:
+#  group: ci-${{ github.ref }}
+#  cancel-in-progress: true
 #
-# CACHING STRATEGY:
-#   We cache ~/.m2/repository keyed on the hash of all pom.xml files.
-#   When any pom.xml changes (new dependency added), the cache is invalidated
-#   and dependencies are re-downloaded. On subsequent pushes with the same
-#   pom.xml files, dependencies are served from cache (~30s saved per run).
+#jobs:
 #
-# INTERVIEW TALKING POINT:
-#   "Every PR triggers CI — the build fails if any test fails or if coverage
-#    drops below 80%. I used JaCoCo for coverage and uploaded the HTML report
-#    as a GitHub artifact so reviewers can inspect which lines aren't covered."
+#  # ─────────────────────────────────────────────────────────────────────────
+#  # Job 1: Build & Test
+#  # Compiles all modules and runs all unit tests.
+#  # ─────────────────────────────────────────────────────────────────────────
+#  build:
+#    name: Build & Test (Java ${{ matrix.java }})
+#    runs-on: ubuntu-latest
+#
+#    # Test against Java 17 (primary) and Java 21 (forward-compat check).
+#    # matrix.java lets us verify the project compiles on both LTS versions
+#    # without maintaining two separate workflow files.
+#    strategy:
+#      matrix:
+#        java: [ '17', '21' ]
+#      fail-fast: false  # run both matrix legs even if one fails
+#
+#    steps:
+#      # ── Checkout ──────────────────────────────────────────────────────────
+#      - name: Checkout repository
+#        uses: actions/checkout@v4
+#        with:
+#          fetch-depth: 0  # full history needed for accurate blame in coverage reports
+#
+#      # ── Java setup ────────────────────────────────────────────────────────
+#      - name: Set up JDK ${{ matrix.java }}
+#        uses: actions/setup-java@v4
+#        with:
+#          java-version: ${{ matrix.java }}
+#          distribution: temurin   # Eclipse Temurin — same JDK used by most production deployments
+#
+#      # ── Maven cache ───────────────────────────────────────────────────────
+#      # Cache key includes ALL pom.xml file hashes.
+#      # Any dependency change invalidates the cache — safe and correct.
+#      - name: Cache Maven dependencies
+#        uses: actions/cache@v4
+#        with:
+#          path: ~/.m2/repository
+#          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+#          restore-keys: |
+#            maven-${{ runner.os }}-
+#
+#      # ── Compile ───────────────────────────────────────────────────────────
+#      # compile phase only — fast feedback before running tests.
+#      # If compilation fails, no point running tests.
+#      - name: Compile all modules
+#        run: mvn compile --no-transfer-progress -T 1C
+#        # -T 1C: use 1 thread per CPU core for parallel module compilation
+#        # --no-transfer-progress: suppress download progress bars (noisy in CI logs)
+#
+#      # ── Unit tests ────────────────────────────────────────────────────────
+#      # Runs tests for all modules EXCEPT cache-integration-test.
+#      # Integration tests require a running server and run in a separate job.
+#      # -pl excludes cache-integration-test and cache-benchmark
+#      # (benchmarks are not tests — they have their own job).
+#      - name: Run unit tests
+#        run: |
+#          mvn test \
+#            --no-transfer-progress \
+#            -pl cache-common,cache-core,cache-server,cache-client \
+#            -am \
+#            -Dsurefire.failIfNoSpecifiedTests=false
+#        # -am: also build modules that the listed ones depend on
+#        # -Dsurefire.failIfNoSpecifiedTests=false: don't fail if a module has no tests yet
+#
+#      # ── Test results ──────────────────────────────────────────────────────
+#      # Publish test results to the GitHub Actions summary UI.
+#      # Shows pass/fail per test class without needing to download artifacts.
+#      - name: Publish test results
+#        uses: EnricoMi/publish-unit-test-result-action@v2
+#        if: always()  # run even if tests failed — we want to see results
+#        with:
+#          files: '**/target/surefire-reports/*.xml'
+#          comment_mode: off  # don't comment on PRs (avoids notification spam)
+#
+#      # ── Build summary ─────────────────────────────────────────────────────
+#      - name: Print build summary
+#        if: always()
+#        run: |
+#          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+#          echo "| Module | Status |" >> $GITHUB_STEP_SUMMARY
+#          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+#          for module in cache-common cache-core cache-server cache-client; do
+#            if [ -d "$module/target" ]; then
+#              echo "| $module | ✅ compiled |" >> $GITHUB_STEP_SUMMARY
+#            else
+#              echo "| $module | ❌ failed |" >> $GITHUB_STEP_SUMMARY
+#            fi
+#          done
+#
+#  # ─────────────────────────────────────────────────────────────────────────
+#  # Job 2: Coverage (JaCoCo)
+#  # Runs on Java 17 only — coverage is policy, not compat check.
+#  # ─────────────────────────────────────────────────────────────────────────
+#  coverage:
+#    name: Code Coverage
+#    runs-on: ubuntu-latest
+#    needs: build  # only run if build succeeded
+#
+#    steps:
+#      - name: Checkout repository
+#        uses: actions/checkout@v4
+#
+#      - name: Set up JDK 17
+#        uses: actions/setup-java@v4
+#        with:
+#          java-version: '17'
+#          distribution: temurin
+#
+#      - name: Cache Maven dependencies
+#        uses: actions/cache@v4
+#        with:
+#          path: ~/.m2/repository
+#          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+#          restore-keys: |
+#            maven-${{ runner.os }}-
+#
+#      # Run tests with JaCoCo coverage agent.
+#      # The 'verify' phase runs jacoco:report and jacoco:check.
+#      # jacoco:check fails the build if coverage < minimum (configured in pom.xml).
+#      - name: Run tests with coverage
+#        run: |
+#          mvn verify \
+#            --no-transfer-progress \
+#            -pl cache-common,cache-core,cache-server,cache-client \
+#            -am \
+#            -Dsurefire.failIfNoSpecifiedTests=false
+#
+#      # Upload the HTML coverage report as a GitHub artifact.
+#      # Downloadable from the Actions run page for 30 days.
+#      # Reviewers can open index.html locally to see line-by-line coverage.
+#      - name: Upload JaCoCo coverage report
+#        uses: actions/upload-artifact@v4
+#        if: always()
+#        with:
+#          name: jacoco-coverage-report
+#          path: |
+#            cache-core/target/site/jacoco/
+#            cache-server/target/site/jacoco/
+#            cache-client/target/site/jacoco/
+#            cache-common/target/site/jacoco/
+#          retention-days: 30
+#
+#      # Print coverage summary to GitHub Actions step summary.
+#      # Visible in the PR UI without downloading the artifact.
+#      - name: Coverage summary
+#        if: always()
+#        run: |
+#          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
+#          echo "" >> $GITHUB_STEP_SUMMARY
+#          for module in cache-common cache-core cache-server cache-client; do
+#            CSV="$module/target/site/jacoco/jacoco.csv"
+#            if [ -f "$CSV" ]; then
+#              # Extract instruction coverage from CSV: INSTRUCTION_MISSED + INSTRUCTION_COVERED
+#              COVERED=$(tail -n +2 "$CSV" | awk -F',' '{c+=$5; m+=$4} END {printf "%.1f", c*100/(c+m+0.001)}')
+#              echo "| $module | ${COVERED}% |" >> $GITHUB_STEP_SUMMARY
+#            fi
+#          done
+#
+#  # ─────────────────────────────────────────────────────────────────────────
+#  # Job 3: Package — build the fat JAR for Docker
+#  # Runs only on main branch pushes (not PRs).
+#  # ─────────────────────────────────────────────────────────────────────────
+#  package:
+#    name: Package Fat JAR
+#    runs-on: ubuntu-latest
+#    needs: [ build, coverage ]
+#    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+#
+#    steps:
+#      - name: Checkout repository
+#        uses: actions/checkout@v4
+#
+#      - name: Set up JDK 17
+#        uses: actions/setup-java@v4
+#        with:
+#          java-version: '17'
+#          distribution: temurin
+#
+#      - name: Cache Maven dependencies
+#        uses: actions/cache@v4
+#        with:
+#          path: ~/.m2/repository
+#          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+#          restore-keys: |
+#            maven-${{ runner.os }}-
+#
+#      # Build only cache-server (and its dependencies) with the shade plugin.
+#      # -DskipTests: tests already passed in the 'build' job — no need to repeat.
+#      # The fat JAR lands at cache-server/target/cache-server-1.0-SNAPSHOT.jar
+#      - name: Build fat JAR
+#        run: |
+#          mvn package \
+#            --no-transfer-progress \
+#            -pl cache-server \
+#            -am \
+#            -DskipTests
+#
+#      # Verify the fat JAR exists and log its size.
+#      - name: Verify fat JAR
+#        run: |
+#          JAR="cache-server/target/cache-server-1.0-SNAPSHOT.jar"
+#          if [ ! -f "$JAR" ]; then
+#            echo "❌ Fat JAR not found at $JAR"
+#            exit 1
+#          fi
+#          SIZE=$(du -sh "$JAR" | cut -f1)
+#          echo "✅ Fat JAR built: $JAR ($SIZE)"
+#          echo "JAR_PATH=$JAR" >> $GITHUB_ENV
+#
+#      # Upload fat JAR as artifact so the Docker build job (in benchmark.yml)
+#      # can download it without rebuilding.
+#      - name: Upload fat JAR artifact
+#        uses: actions/upload-artifact@v4
+#        with:
+#          name: jcache-server-jar
+#          path: cache-server/target/cache-server-1.0-SNAPSHOT.jar
+#          retention-days: 7
+#
+#      # Build and push Docker image on main branch.
+#      # Requires DOCKER_USERNAME and DOCKER_PASSWORD secrets in repo settings.
+#      - name: Set up Docker Buildx
+#        uses: docker/setup-buildx-action@v3
+#
+#      - name: Log in to Docker Hub
+#        uses: docker/login-action@v3
+#        with:
+#          username: ${{ secrets.DOCKER_USERNAME }}
+#          password: ${{ secrets.DOCKER_PASSWORD }}
+#
+#      - name: Build and push Docker image
+#        uses: docker/build-push-action@v5
+#        with:
+#          context: .
+#          file: distribution/Dockerfile
+#          push: true
+#          # Tag with both 'latest' and the exact commit SHA.
+#          # 'latest' for easy docker pull.
+#          # SHA tag for reproducibility — you can always pull the exact build.
+#          tags: |
+#            ${{ secrets.DOCKER_USERNAME }}/jcache:latest
+#            ${{ secrets.DOCKER_USERNAME }}/jcache:${{ github.sha }}
+#          cache-from: type=gha   # use GitHub Actions layer cache
+#          cache-to: type=gha,mode=max
+#
+#      - name: Docker push summary
+#        run: |
+#          echo "## Docker Image Published" >> $GITHUB_STEP_SUMMARY
+#          echo "- **Image**: \`${{ secrets.DOCKER_USERNAME }}/jcache:latest\`" >> $GITHUB_STEP_SUMMARY
+#          echo "- **SHA tag**: \`${{ secrets.DOCKER_USERNAME }}/jcache:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+#          echo "- **Pull command**: \`docker pull ${{ secrets.DOCKER_USERNAME }}/jcache:latest\`" >> $GITHUB_STEP_SUMMARY
 
 name: CI
 
 on:
   push:
-    branches:
-      - main
-      - develop
-      - 'feature/**'
-      - 'fix/**'
+    branches: [ main, develop ]
   pull_request:
-    branches:
-      - main
-      - develop
-
-# Cancel in-progress runs for the same branch when a new push arrives.
-# Saves CI minutes — no point finishing a run that's already outdated.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+    branches: [ main ]
 
 jobs:
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # Job 1: Build & Test
-  # Compiles all modules and runs all unit tests.
-  # ─────────────────────────────────────────────────────────────────────────
-  build:
-    name: Build & Test (Java ${{ matrix.java }})
+  build-and-test:
     runs-on: ubuntu-latest
 
-    # Test against Java 17 (primary) and Java 21 (forward-compat check).
-    # matrix.java lets us verify the project compiles on both LTS versions
-    # without maintaining two separate workflow files.
-    strategy:
-      matrix:
-        java: [ '17', '21' ]
-      fail-fast: false  # run both matrix legs even if one fails
-
     steps:
-      # ── Checkout ──────────────────────────────────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # full history needed for accurate blame in coverage reports
+      - uses: actions/checkout@v4
 
-      # ── Java setup ────────────────────────────────────────────────────────
-      - name: Set up JDK ${{ matrix.java }}
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ matrix.java }}
-          distribution: temurin   # Eclipse Temurin — same JDK used by most production deployments
-
-      # ── Maven cache ───────────────────────────────────────────────────────
-      # Cache key includes ALL pom.xml file hashes.
-      # Any dependency change invalidates the cache — safe and correct.
-      - name: Cache Maven dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
-
-      # ── Compile ───────────────────────────────────────────────────────────
-      # compile phase only — fast feedback before running tests.
-      # If compilation fails, no point running tests.
-      - name: Compile all modules
-        run: mvn compile --no-transfer-progress -T 1C
-        # -T 1C: use 1 thread per CPU core for parallel module compilation
-        # --no-transfer-progress: suppress download progress bars (noisy in CI logs)
-
-      # ── Unit tests ────────────────────────────────────────────────────────
-      # Runs tests for all modules EXCEPT cache-integration-test.
-      # Integration tests require a running server and run in a separate job.
-      # -pl excludes cache-integration-test and cache-benchmark
-      # (benchmarks are not tests — they have their own job).
-      - name: Run unit tests
-        run: |
-          mvn test \
-            --no-transfer-progress \
-            -pl cache-common,cache-core,cache-server,cache-client \
-            -am \
-            -Dsurefire.failIfNoSpecifiedTests=false
-        # -am: also build modules that the listed ones depend on
-        # -Dsurefire.failIfNoSpecifiedTests=false: don't fail if a module has no tests yet
-
-      # ── Test results ──────────────────────────────────────────────────────
-      # Publish test results to the GitHub Actions summary UI.
-      # Shows pass/fail per test class without needing to download artifacts.
-      - name: Publish test results
-        uses: EnricoMi/publish-unit-test-result-action@v2
-        if: always()  # run even if tests failed — we want to see results
-        with:
-          files: '**/target/surefire-reports/*.xml'
-          comment_mode: off  # don't comment on PRs (avoids notification spam)
-
-      # ── Build summary ─────────────────────────────────────────────────────
-      - name: Print build summary
-        if: always()
-        run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Module | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
-          for module in cache-common cache-core cache-server cache-client; do
-            if [ -d "$module/target" ]; then
-              echo "| $module | ✅ compiled |" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "| $module | ❌ failed |" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # Job 2: Coverage (JaCoCo)
-  # Runs on Java 17 only — coverage is policy, not compat check.
-  # ─────────────────────────────────────────────────────────────────────────
-  coverage:
-    name: Code Coverage
-    runs-on: ubuntu-latest
-    needs: build  # only run if build succeeded
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
-          distribution: temurin
+          distribution: 'temurin'
+          cache: maven
 
-      - name: Cache Maven dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
+      - name: Build all modules
+        run: mvn clean install -DskipTests
 
-      # Run tests with JaCoCo coverage agent.
-      # The 'verify' phase runs jacoco:report and jacoco:check.
-      # jacoco:check fails the build if coverage < minimum (configured in pom.xml).
-      - name: Run tests with coverage
-        run: |
-          mvn verify \
-            --no-transfer-progress \
-            -pl cache-common,cache-core,cache-server,cache-client \
-            -am \
-            -Dsurefire.failIfNoSpecifiedTests=false
+      - name: Run cache-common tests
+        run: mvn test -pl cache-common
 
-      # Upload the HTML coverage report as a GitHub artifact.
-      # Downloadable from the Actions run page for 30 days.
-      # Reviewers can open index.html locally to see line-by-line coverage.
-      - name: Upload JaCoCo coverage report
+      - name: Run cache-core tests
+        run: mvn test -pl cache-core
+
+      - name: Run cache-client tests
+        run: mvn test -pl cache-client
+
+      - name: Run server handler tests
+        run: mvn test -pl cache-server
+
+      - name: Run integration tests
+        run: mvn test -pl cache-integration-test
+
+      - name: Generate JaCoCo coverage report
+        run: mvn verify -pl cache-core jacoco:report
+
+      - name: Upload coverage report
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: jacoco-coverage-report
-          path: |
-            cache-core/target/site/jacoco/
-            cache-server/target/site/jacoco/
-            cache-client/target/site/jacoco/
-            cache-common/target/site/jacoco/
-          retention-days: 30
+          name: coverage-report
+          path: cache-core/target/site/jacoco/
 
-      # Print coverage summary to GitHub Actions step summary.
-      # Visible in the PR UI without downloading the artifact.
-      - name: Coverage summary
-        if: always()
-        run: |
-          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          for module in cache-common cache-core cache-server cache-client; do
-            CSV="$module/target/site/jacoco/jacoco.csv"
-            if [ -f "$CSV" ]; then
-              # Extract instruction coverage from CSV: INSTRUCTION_MISSED + INSTRUCTION_COVERED
-              COVERED=$(tail -n +2 "$CSV" | awk -F',' '{c+=$5; m+=$4} END {printf "%.1f", c*100/(c+m+0.001)}')
-              echo "| $module | ${COVERED}% |" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # Job 3: Package — build the fat JAR for Docker
-  # Runs only on main branch pushes (not PRs).
-  # ─────────────────────────────────────────────────────────────────────────
-  package:
-    name: Package Fat JAR
+  docker-build:
     runs-on: ubuntu-latest
-    needs: [ build, coverage ]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build-and-test
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           java-version: '17'
-          distribution: temurin
+          distribution: 'temurin'
+          cache: maven
 
-      - name: Cache Maven dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
-
-      # Build only cache-server (and its dependencies) with the shade plugin.
-      # -DskipTests: tests already passed in the 'build' job — no need to repeat.
-      # The fat JAR lands at cache-server/target/cache-server-1.0-SNAPSHOT.jar
       - name: Build fat JAR
+        run: mvn clean package -pl cache-server -am -DskipTests
+
+      - name: Build Docker image
+        run: docker build -f distribution/Dockerfile -t jcache:ci-test .
+
+      - name: Smoke test Docker image
         run: |
-          mvn package \
-            --no-transfer-progress \
-            -pl cache-server \
-            -am \
-            -DskipTests
-
-      # Verify the fat JAR exists and log its size.
-      - name: Verify fat JAR
-        run: |
-          JAR="cache-server/target/cache-server-1.0-SNAPSHOT.jar"
-          if [ ! -f "$JAR" ]; then
-            echo "❌ Fat JAR not found at $JAR"
-            exit 1
-          fi
-          SIZE=$(du -sh "$JAR" | cut -f1)
-          echo "✅ Fat JAR built: $JAR ($SIZE)"
-          echo "JAR_PATH=$JAR" >> $GITHUB_ENV
-
-      # Upload fat JAR as artifact so the Docker build job (in benchmark.yml)
-      # can download it without rebuilding.
-      - name: Upload fat JAR artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: jcache-server-jar
-          path: cache-server/target/cache-server-1.0-SNAPSHOT.jar
-          retention-days: 7
-
-      # Build and push Docker image on main branch.
-      # Requires DOCKER_USERNAME and DOCKER_PASSWORD secrets in repo settings.
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: distribution/Dockerfile
-          push: true
-          # Tag with both 'latest' and the exact commit SHA.
-          # 'latest' for easy docker pull.
-          # SHA tag for reproducibility — you can always pull the exact build.
-          tags: |
-            ${{ secrets.DOCKER_USERNAME }}/jcache:latest
-            ${{ secrets.DOCKER_USERNAME }}/jcache:${{ github.sha }}
-          cache-from: type=gha   # use GitHub Actions layer cache
-          cache-to: type=gha,mode=max
-
-      - name: Docker push summary
-        run: |
-          echo "## Docker Image Published" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ secrets.DOCKER_USERNAME }}/jcache:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **SHA tag**: \`${{ secrets.DOCKER_USERNAME }}/jcache:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Pull command**: \`docker pull ${{ secrets.DOCKER_USERNAME }}/jcache:latest\`" >> $GITHUB_STEP_SUMMARY
+          docker run -d -p 6379:6379 --name jcache-test jcache:ci-test
+          sleep 3
+          echo "PING" | nc -q1 localhost 6379 | grep "+PONG"
+          docker stop jcache-test
