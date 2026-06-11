@@ -312,7 +312,7 @@ jobs:
 
       - uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: '23'
           distribution: 'temurin'
           cache: maven
 
@@ -324,7 +324,7 @@ jobs:
           java -jar cache-benchmark/target/benchmarks.jar \
             -f 1 -wi 1 -i 3 \
             -rf json -rff benchmark-results.json \
-            "LRUBenchmark|LFUBenchmark|PolicyComparison"
+            "LRUBenchmark|LFUBenchmark|PolicyComparison|ConcurrencyBenchmark"
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
