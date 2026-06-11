@@ -8,7 +8,7 @@
     <parent>
         <groupId>com.cache</groupId>
         <artifactId>JCache</artifactId>
-        <version>1.0-SNAPSHOT</version>
+        <version>1.0.0</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -59,19 +59,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <!--
-                    Integration tests are slower than unit tests.
-                    Exclude them from the default `mvn test` phase if you want
-                    (run only on `mvn verify`). To do that, add:
-
-                    <configuration>
-                        <excludes>
-                            <exclude>**/*IntegrationTest.java</exclude>
-                        </excludes>
-                    </configuration>
-
-                    For now we leave them included in `mvn test`.
-                -->
+                <version>3.2.5</version>
             </plugin>
         </plugins>
     </build>
