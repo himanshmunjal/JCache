@@ -7,6 +7,7 @@ import com.cache.concurrent.SegmentedCache;
 import com.cache.policy.LRUCache;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
+import org.openjdk.jmh.results.format.ResultFormatType;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
@@ -94,11 +95,11 @@ import java.util.concurrent.atomic.AtomicLong;
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 @State(Scope.Benchmark)
 @Fork(value = 2, jvmArgs = {
-        "-Xms512m", "-Xmx512m",
+        "-Xms512m", "-Xmx512m"
         // Disable biased locking — it can make single-threaded lock acquisition
         // look artificially fast and then spike on first contention.
         // We want clean numbers that reflect true concurrent behavior.
-        "-XX:-UseBiasedLocking"
+//        "-XX:-UseBiasedLocking"
 })
 @Warmup(iterations = 5, time = 2, timeUnit = TimeUnit.SECONDS)
 @Measurement(iterations = 10, time = 5, timeUnit = TimeUnit.SECONDS)
@@ -384,6 +385,8 @@ public class ConcurrencyBenchmark {
 //                 For quick local testing, restrict to fewer params:
                 .param("strategy", "COARSE", "SEGMENTED", "LOCKFREE")
                  .param("threadCount", "1", "4", "8", "16","32")
+                .resultFormat(ResultFormatType.JSON)
+                .result("concurrency-results.json")
                 .build();
 
         new Runner(opt).run();
