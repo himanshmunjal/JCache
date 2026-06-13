@@ -3,6 +3,7 @@ package com.cache.ttl;
 import com.cache.api.Cache;
 import com.cache.api.CacheStats;
 
+import java.security.Key;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -216,6 +217,19 @@ public class TTLCache<K, V> implements Cache<K, V> {
     public void put(K key, V value) {
         // TTL=0 means no expiry in our convention.
         put(key, value, 0);
+    }
+
+    public boolean expire(K Key, long ttlSeconds){
+        if(ttlSeconds < 0){
+            throw new IllegalArgumentException("TTL cannot be negative");
+        }
+
+        if(delegate.get(Key) == null){
+            return false;
+        }
+        long expiryTime = System.currentTimeMillis() + (ttlSeconds * 1000L);
+        expiryMap.put(Key, expiryTime);
+        return true;
     }
 
     /**
