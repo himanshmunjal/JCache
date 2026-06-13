@@ -4,6 +4,7 @@ import com.cache.api.Cache;
 import com.cache.api.CacheStats;
 import com.cache.server.ServerConfig;
 import com.cache.server.metrics.ServerMetrics;
+import com.cache.ttl.TTLCache;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 
@@ -193,6 +194,8 @@ public class CacheServerHandler extends SimpleChannelInboundHandler<String> {
                 case "DEL":    response = handleDelete(tokens);      break; // alias for DELETE
                 case "STATS":  response = handleStats();             break;
                 case "FLUSH":  response = handleFlush();             break;
+                case "TTL" :   response = handleTTL(tokens);         break;
+//                case "PERSIST": response = handlePersist(tokens);    break;
                 case "QUIT":
                 case "EXIT":
                     // Send BYE then close — writeAndFlush returns a Future,
@@ -303,21 +306,17 @@ public class CacheServerHandler extends SimpleChannelInboundHandler<String> {
             metrics.recordError();
             return ERR + "wrong number of arguments for PUT" + CRLF;
         }
-
         String key = tokens[1];
         long ttl   = 0; // default: no expiry
-
         // Determine if the last token is a TTL (a valid non-negative long).
         // If yes, the value is everything between key and the TTL token.
         // If no, the value is everything after the key.
         String valueRaw;
         String lastToken = tokens[tokens.length - 1];
         boolean lastIsNumber = isNonNegativeLong(lastToken);
-
         if (lastIsNumber && tokens.length >= 4) {
             // Last token is TTL, value is middle section
             ttl = Long.parseLong(lastToken);
-
             // Reconstruct value: skip "PUT key " prefix, strip " ttl" suffix
             int keyEnd   = original.indexOf(key) + key.length();
             int ttlStart = original.lastIndexOf(lastToken);
@@ -327,18 +326,15 @@ public class CacheServerHandler extends SimpleChannelInboundHandler<String> {
             int keyEnd = original.indexOf(key) + key.length();
             valueRaw   = original.substring(keyEnd).trim();
         }
-
         if (valueRaw.isEmpty()) {
             metrics.recordError();
             return ERR + "value cannot be empty" + CRLF;
         }
-
         // Validate TTL range
         if (ttl < 0) {
             metrics.recordError();
             return ERR + "TTL cannot be negative" + CRLF;
         }
-
         // Delegate to TTLCache-aware put if TTL > 0, else plain put
         long startNs = System.nanoTime();
         try {
@@ -358,6 +354,35 @@ public class CacheServerHandler extends SimpleChannelInboundHandler<String> {
         metrics.recordPut(durationNs);
         return OK;
     }
+
+    private String handleTTL(String[] tokens){
+        if (tokens.length != 3) {
+            metrics.recordError();
+            return ERR + "wrong number of arguments for TTL" + CRLF;
+        }
+        String key = tokens[1];
+
+        if(!isNonNegativeLong(tokens[2])){
+            metrics.recordError();
+            return ERR + "TTL must be non-negative integer" + CRLF;
+        }
+        long ttl = Long.parseLong(tokens[2]);
+        try{
+            if(!(cache instanceof TTLCache)){
+                metrics.recordError();
+                return ERR + "cache does not support TTL" + CRLF;
+            }
+            boolean update = ((TTLCache<String, String>) cache).expire(key, ttl);
+            if(!update){
+                return ERR + "key not found" + CRLF;
+            }
+        } catch (Exception e) {
+            metrics.recordError();
+            return ERR + e.getMessage() + CRLF;
+        }
+        return OK;
+    }
+
 
     /**
      * Handles DELETE <key> — removes a key from the cache.
