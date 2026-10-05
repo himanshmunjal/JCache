@@ -1,0 +1,63 @@
+# Three independent JCache nodes for trying out ClusterCacheClient locally.
+#
+#   docker compose -f distribution/docker-compose.yml up -d --build
+#   docker compose -f distribution/docker-compose.yml down        # keeps data
+#   docker compose -f distribution/docker-compose.yml down -v     # deletes data
+
+x-node: &node
+  image: himanshmunjal/jcache:${JCACHE_VERSION:-latest}
+  build:
+    context: ..
+    dockerfile: distribution/Dockerfile
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/$$JCACHE_PORT && printf \"PING\\r\\n\" >&3 && read -r -t 2 r <&3 && [[ $$r == +PONG* ]]'"]
+    interval: 10s
+    timeout: 3s
+    start_period: 10s
+    retries: 3
+  deploy:
+    resources:
+      limits:
+        memory: 512M
+
+x-env: &env
+  JCACHE_POLICY: ${JCACHE_POLICY:-LRU}
+  JCACHE_CAPACITY: ${JCACHE_CAPACITY:-10000}
+  JCACHE_THREADS: ${JCACHE_THREADS:-8}
+  JCACHE_MAX_CONNECTIONS: ${JCACHE_MAX_CONNECTIONS:-1000}
+  JCACHE_PERSISTENCE_ENABLED: ${JCACHE_PERSISTENCE_ENABLED:-true}
+  JCACHE_SNAPSHOT_INTERVAL_MS: ${JCACHE_SNAPSHOT_INTERVAL_MS:-300000}
+
+services:
+  jcache-1:
+    <<: *node
+    container_name: jcache-node-1
+    environment:
+      <<: *env
+      JCACHE_PORT: 6379
+    ports: ["6379:6379"]
+    volumes: ["jcache-data-1:/data"]
+
+  jcache-2:
+    <<: *node
+    container_name: jcache-node-2
+    environment:
+      <<: *env
+      JCACHE_PORT: 6380
+    ports: ["6380:6380"]
+    volumes: ["jcache-data-2:/data"]
+
+  jcache-3:
+    <<: *node
+    container_name: jcache-node-3
+    environment:
+      <<: *env
+      JCACHE_PORT: 6381
+    ports: ["6381:6381"]
+    volumes: ["jcache-data-3:/data"]
+
+volumes:
+  jcache-data-1:
+  jcache-data-2:
+  jcache-data-3:
