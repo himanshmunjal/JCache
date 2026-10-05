@@ -1,39 +1,43 @@
+# Build output
 target/
-!.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
-.kotlin
+dependency-reduced-pom.xml
+*.class
+*.jar
 
-### IntelliJ IDEA ###
-.idea/modules.xml
-.idea/jarRepositories.xml
-.idea/compiler.xml
-.idea/libraries/
-*.iws
+# Runtime data
+jcache-data/
+*.snapshot
+*.aof
+*-results.json
+jmh-result*.json
+
+# Logs and JVM crash dumps
+*.log
+hs_err_pid*
+replay_pid*
+
+# IDEs
+.idea/
 *.iml
+*.iws
 *.ipr
-
-### Eclipse ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
-
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
-build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-
-### VS Code ###
 .vscode/
+.classpath
+.project
+.settings/
+.junie/
+.factorypath
+.apt_generated/
+bin/
+out/
 
-### Mac OS ###
+# OS
 .DS_Store
+Thumbs.db
+
+# Local secrets
+.env
+
+# Personal notes kept out of the repository
+archived/
+docs/Project reference.md
