@@ -1,8 +1,9 @@
 package com.cache;
 
 import com.cache.api.Cache;
-import com.cache.api.CacheStats;
 import com.cache.api.CachePolicyType;
+import com.cache.api.CacheStats;
+import com.cache.concurrent.CoarseGrainedCache;
 import com.cache.policy.ARCCache;
 import com.cache.policy.LFUCache;
 import com.cache.policy.LRUCache;
@@ -14,46 +15,13 @@ import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Test suite for CacheFactory and MetricsCollectingCache.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHAT WE ARE PROVING
- * ─────────────────────────────────────────────────────────────────────────────
- * 1. Static factory methods return correct concrete types.
- * 2. withPolicy() routes correctly for every EvictionPolicy enum value.
- * 3. withTTL() wraps the delegate in TTLCache correctly.
- * 4. withMetrics() wraps the delegate in MetricsCollectingCache correctly.
- * 5. Builder composes wrappers in the correct order.
- * 6. Metrics are recorded correctly through the MetricsCollectingCache wrapper.
- * 7. Invalid inputs are rejected at the factory boundary with clear errors.
- * 8. Composed caches (TTL + metrics) function end-to-end correctly.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * TESTING APPROACH FOR DECORATORS
- * ─────────────────────────────────────────────────────────────────────────────
- * Decorator tests have two concerns:
- *   (a) Does the decorator correctly DELEGATE to the underlying cache?
- *       → put, get, evict, size all reach the delegate.
- *   (b) Does the decorator correctly ADD its own behaviour?
- *       → TTLCache: expiry fires. MetricsCache: counters increment.
- *
- * We test (a) by doing put/get round trips and checking values.
- * We test (b) by checking counter values and TTL expiry.
- */
 @DisplayName("CacheFactory Tests")
 class CacheFactoryTest {
-
-    // =========================================================================
-    // 1. Static factory methods — correct types returned
-    // =========================================================================
-
     @Test
     @DisplayName("lru() returns a working LRU cache")
     void testLRU_returnsWorkingCache() {
         Cache<String, String> cache = CacheFactory.lru(10);
 
-        // Verify it's usable — not just non-null
         cache.put("key", "value");
         assertEquals("value", cache.get("key"));
         assertEquals(1, cache.size());
@@ -64,7 +32,6 @@ class CacheFactoryTest {
     void testLRU_returnsCorrectType() {
         Cache<String, String> cache = CacheFactory.lru(10);
 
-        // instanceof check — confirms factory wired the right class
         assertInstanceOf(LRUCache.class, cache,
                 "lru() should return an LRUCache");
     }
@@ -105,10 +72,6 @@ class CacheFactoryTest {
                 "arc() should return an ARCCache");
     }
 
-    // =========================================================================
-    // 2. withPolicy() — enum-driven routing
-    // =========================================================================
-
     @Test
     @DisplayName("withPolicy(LRU) returns LRUCache")
     void testWithPolicy_LRU_returnsLRUCache() {
@@ -136,8 +99,6 @@ class CacheFactoryTest {
     @Test
     @DisplayName("withPolicy() with all enum values returns working caches")
     void testWithPolicy_allValues_allWork() {
-        // Every EvictionPolicy value must produce a usable cache.
-        // If a new policy is added to the enum but not the factory, this test fails.
         for (CachePolicyType policy : CachePolicyType.values()) {
             Cache<String, String> cache = CacheFactory.withPolicy(policy, 5);
 
@@ -147,10 +108,6 @@ class CacheFactoryTest {
                     "Cache from withPolicy(" + policy + ") must be functional");
         }
     }
-
-    // =========================================================================
-    // 3. withTTL() wrapper
-    // =========================================================================
 
     @Test
     @DisplayName("withTTL() wraps delegate in TTLCache")
@@ -176,7 +133,6 @@ class CacheFactoryTest {
     @Test
     @DisplayName("withTTL() with Duration.ZERO creates cache with no default expiry")
     void testWithTTL_zeroDuration_noExpiry() {
-        // Duration.ZERO means "no default TTL" — keys should not expire
         Cache<String, String> cache = CacheFactory.withTTL(
                 CacheFactory.lru(10), Duration.ZERO
         );
@@ -215,10 +171,6 @@ class CacheFactoryTest {
         );
     }
 
-    // =========================================================================
-    // 4. withMetrics() wrapper
-    // =========================================================================
-
     @Test
     @DisplayName("withMetrics() wraps delegate in MetricsCollectingCache")
     void testWithMetrics_returnsMetricsCollectingCache() {
@@ -251,11 +203,11 @@ class CacheFactoryTest {
         );
 
         cache.put("key", "value");
-        cache.get("key");  // hit
-        cache.get("key");  // hit
-        cache.get("key");  // hit
+        cache.get("key");
+        cache.get("key");
+        cache.get("key");
 
-        CacheStats stats = cache.getstats();
+        CacheStats stats = cache.getStats();
         assertEquals(3, stats.hits(), "3 successful gets should record 3 hits");
     }
 
@@ -266,18 +218,18 @@ class CacheFactoryTest {
                 CacheFactory.lru(10), "miss-test"
         );
 
-        cache.get("nope");  // miss
-        cache.get("nope2"); // miss
+        cache.get("nope");
+        cache.get("nope2");
 
-        CacheStats stats = cache.getstats();
+        CacheStats stats = cache.getStats();
         assertEquals(2, stats.misses(), "2 failed gets should record 2 misses");
     }
 
     @Test
-    @DisplayName("withMetrics() records manual evictions correctly")
+    @DisplayName("withMetrics() records manual evictions separately from evictions")
     void testWithMetrics_recordsManualEvictions() {
-        Cache<String, String> cache = CacheFactory.withMetrics(
-                CacheFactory.lru(10), "evict-test"
+        CacheFactory.MetricsCollectingCache<String, String> cache = new CacheFactory.MetricsCollectingCache<>(
+                CacheFactory.lru(10), new CacheMetricsCollector("evict-test")
         );
 
         cache.put("a", "1");
@@ -285,9 +237,25 @@ class CacheFactoryTest {
         cache.evict("a");
         cache.evict("b");
 
-        CacheStats stats = cache.getstats();
-        assertEquals(2, stats.evictions(),
-                "2 explicit evictions should be recorded");
+        assertEquals(0, cache.getStats().evictions(), "Explicit removals are not evictions");
+        assertEquals(2, cache.getMetricsCollector().getManualEvictions());
+    }
+
+    @Test
+    @DisplayName("withMetrics() records evictions made by the policy")
+    void testWithMetrics_recordsPolicyEvictions() {
+        CacheFactory.MetricsCollectingCache<String, String> cache = new CacheFactory.MetricsCollectingCache<>(
+                CacheFactory.lru(2), new CacheMetricsCollector("capacity-test")
+        );
+
+        cache.put("a", "1");
+        cache.put("b", "2");
+        cache.put("c", "3");
+        cache.put("d", "4");
+        cache.put("d", "5");
+
+        assertEquals(2, cache.getStats().evictions());
+        assertEquals(2, cache.getMetricsCollector().getPolicyEvictions());
     }
 
     @Test
@@ -298,10 +266,9 @@ class CacheFactoryTest {
         );
 
         cache.put("x", "1");
-        cache.get("x");    // hit
-        cache.get("miss"); // miss
+        cache.get("x");
+        cache.get("miss");
 
-        // Cast to MetricsCollectingCache to access the richer snapshot API
         CacheFactory.MetricsCollectingCache<String, String> metricsCache =
                 (CacheFactory.MetricsCollectingCache<String, String>) cache;
 
@@ -332,10 +299,6 @@ class CacheFactoryTest {
         );
     }
 
-    // =========================================================================
-    // 5. Builder — composition
-    // =========================================================================
-
     @Test
     @DisplayName("Builder with policy only returns bare policy cache")
     void testBuilder_policyOnly_returnsBareCache() {
@@ -343,7 +306,6 @@ class CacheFactoryTest {
                 .<String, String>builder(CachePolicyType.LRU, 10)
                 .build();
 
-        // No TTL or metrics wrapper — should be LRUCache directly
         assertInstanceOf(LRUCache.class, cache,
                 "Builder with no wrappers should return bare policy cache");
     }
@@ -373,17 +335,14 @@ class CacheFactoryTest {
     }
 
     @Test
-    @DisplayName("Builder with TTL + metrics — outermost wrapper is MetricsCollectingCache")
+    @DisplayName("Builder with TTL + metrics: outermost wrapper is MetricsCollectingCache")
     void testBuilder_TTLAndMetrics_correctWrapperOrder() {
-        // Correct order: MetricsCache(TTLCache(LRUCache))
-        // MetricsCache is outermost so expired-key misses are counted correctly.
         Cache<String, String> cache = CacheFactory
                 .<String, String>builder(CachePolicyType.ARC, 100)
                 .withTTL(Duration.ofSeconds(60))
                 .withMetrics("composed-cache")
                 .build();
 
-        // Outermost wrapper should be MetricsCollectingCache
         assertInstanceOf(CacheFactory.MetricsCollectingCache.class, cache,
                 "With both TTL and metrics, MetricsCollectingCache must be outermost");
     }
@@ -422,7 +381,7 @@ class CacheFactoryTest {
     }
 
     @Test
-    @DisplayName("Builder withMetrics — hit/miss stats flow through correctly")
+    @DisplayName("Builder withMetrics: hit/miss stats flow through correctly")
     void testBuilder_metricsStats_flowThroughCorrectly() {
         Cache<String, String> cache = CacheFactory
                 .<String, String>builder(CachePolicyType.LRU, 10)
@@ -432,11 +391,11 @@ class CacheFactoryTest {
         cache.put("a", "1");
         cache.put("b", "2");
 
-        cache.get("a");      // hit
-        cache.get("b");      // hit
-        cache.get("absent"); // miss
+        cache.get("a");
+        cache.get("b");
+        cache.get("absent");
 
-        CacheStats stats = cache.getstats();
+        CacheStats stats = cache.getStats();
 
         assertEquals(2, stats.hits(),   "2 hits expected");
         assertEquals(1, stats.misses(), "1 miss expected");
@@ -445,9 +404,6 @@ class CacheFactoryTest {
     @Test
     @DisplayName("Builder withSweepInterval configures TTL sweeper interval")
     void testBuilder_withSweepInterval_doesNotThrow() {
-        // We can't directly observe the sweep interval,
-        // but we can verify the builder accepts it without error
-        // and the resulting cache is functional.
         assertDoesNotThrow(() -> {
             Cache<String, String> cache = CacheFactory
                     .<String, String>builder(CachePolicyType.LRU, 10)
@@ -463,22 +419,16 @@ class CacheFactoryTest {
     @Test
     @DisplayName("Builder withSweepInterval without withTTL still builds correctly")
     void testBuilder_sweepIntervalWithoutTTL_stillBuilds() {
-        // Sweep interval is ignored if TTL is not configured.
-        // Should not throw — just a no-op configuration.
         assertDoesNotThrow(() -> {
             Cache<String, String> cache = CacheFactory
                     .<String, String>builder(CachePolicyType.LRU, 10)
-                    .withSweepInterval(200) // no withTTL() — this is effectively ignored
+                    .withSweepInterval(200)
                     .build();
 
             cache.put("k", "v");
             assertEquals("v", cache.get("k"));
         });
     }
-
-    // =========================================================================
-    // 6. Invalid capacity — rejected at factory boundary
-    // =========================================================================
 
     @Test
     @DisplayName("lru() with capacity=0 throws IllegalArgumentException")
@@ -543,15 +493,9 @@ class CacheFactoryTest {
         );
     }
 
-    // =========================================================================
-    // 7. CacheFactory is not instantiable (utility class)
-    // =========================================================================
-
     @Test
     @DisplayName("CacheFactory constructor throws UnsupportedOperationException")
     void testCacheFactory_notInstantiable() throws Exception {
-        // Verify the private constructor throws when called via reflection.
-        // This ensures no one accidentally instantiates the utility class.
         var constructor = CacheFactory.class.getDeclaredConstructor();
         constructor.setAccessible(true);
 
@@ -561,10 +505,6 @@ class CacheFactoryTest {
         );
     }
 
-    // =========================================================================
-    // 8. withMetrics() — metrics reset
-    // =========================================================================
-
     @Test
     @DisplayName("MetricsCollectingCache: reset() clears all counters")
     void testMetricsCache_reset_clearsCounters() {
@@ -573,20 +513,46 @@ class CacheFactoryTest {
         );
 
         cache.put("k", "v");
-        cache.get("k");    // hit
-        cache.get("miss"); // miss
+        cache.get("k");
+        cache.get("miss");
 
-        // Cast to access the collector and call reset()
         CacheFactory.MetricsCollectingCache<String, String> metricsCache =
                 (CacheFactory.MetricsCollectingCache<String, String>) cache;
         metricsCache.getMetricsCollector().reset();
 
-        CacheStats stats = cache.getstats();
+        CacheStats stats = cache.getStats();
         assertEquals(0, stats.hits(),   "Hits should be 0 after reset");
         assertEquals(0, stats.misses(), "Misses should be 0 after reset");
 
-        // The underlying data should still be there — reset() only clears stats
         assertEquals("v", cache.get("k"),
                 "Data must still be accessible after stats reset");
+    }
+
+    @Test
+    @DisplayName("withTTL() applies the default TTL to plain puts")
+    void testWithTTL_appliesDefaultTtl() throws InterruptedException {
+        TTLCache<String, String> cache = CacheFactory.withTTL(
+                new CoarseGrainedCache<>(CacheFactory.lru(10)), Duration.ofMillis(200));
+        try {
+            cache.put("k", "v");
+            assertEquals("v", cache.get("k"));
+            Thread.sleep(400);
+            assertNull(cache.get("k"));
+        } finally {
+            cache.shutdown();
+        }
+    }
+
+    @Test
+    @DisplayName("builder().withTTL() applies the default TTL to plain puts")
+    void testBuilderWithTTL_appliesDefaultTtl() throws InterruptedException {
+        Cache<String, String> cache = CacheFactory.<String, String>builder(CachePolicyType.LFU, 10)
+                .withTTL(Duration.ofMillis(200))
+                .withSweepInterval(50)
+                .build();
+        cache.put("k", "v");
+        Thread.sleep(400);
+        assertNull(cache.get("k"));
+        ((TTLCache<String, String>) cache).shutdown();
     }
 }

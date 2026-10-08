@@ -7,17 +7,12 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @DisplayName("ARCCache Tests")
 class ARCCacheTest {
-
     private Cache<String, String> cache;
 
     @BeforeEach
     void setUp() {
         cache = new ARCCache<>(3);
     }
-
-    // =========================================================================
-    // Basic Operations
-    // =========================================================================
 
     @Test
     @DisplayName("Basic put/get works")
@@ -42,10 +37,6 @@ class ARCCacheTest {
         assertEquals(2, cache.size());
     }
 
-    // =========================================================================
-    // ARC Adaptivity
-    // =========================================================================
-
     @Test
     @DisplayName("Recently used entries survive")
     void testRecencyProtection() {
@@ -60,7 +51,6 @@ class ARCCacheTest {
         assertEquals("1", cache.get("A"));
     }
 
-    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Frequently used entries survive")
     void testFrequencyProtection() {
@@ -77,7 +67,6 @@ class ARCCacheTest {
         assertEquals("1", cache.get("A"));
     }
 
-    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("ARC adapts between recency and frequency")
     void testAdaptiveBehaviour() {
@@ -94,10 +83,6 @@ class ARCCacheTest {
 
         assertEquals("1", cache.get("A"));
     }
-
-    // =========================================================================
-    // Replacement Behaviour
-    // =========================================================================
 
     @Test
     @DisplayName("Cache never exceeds capacity")
@@ -118,12 +103,8 @@ class ARCCacheTest {
         cache.put("C", "3");
         cache.put("D", "4");
 
-        assertTrue(cache.getstats().evictions() >= 1);
+        assertTrue(cache.getStats().evictions() >= 1);
     }
-
-    // =========================================================================
-    // Update Existing Keys
-    // =========================================================================
 
     @Test
     @DisplayName("Updating existing key updates value")
@@ -143,10 +124,6 @@ class ARCCacheTest {
         assertEquals(1, cache.size());
     }
 
-    // =========================================================================
-    // Edge Cases
-    // =========================================================================
-
     @Test
     @DisplayName("Capacity one behaves correctly")
     void testCapacityOne() {
@@ -159,18 +136,13 @@ class ARCCacheTest {
         assertEquals("2", tiny.get("B"));
     }
 
-    @Disabled("Temporarily disabled during server integration")
     @Test
-    @DisplayName("Capacity zero behaves gracefully")
+    @DisplayName("Capacity zero is rejected")
     void testCapacityZero() {
-        Cache<String, String> zero = new ARCCache<>(0);
-
-        zero.put("A", "1");
-
-        assertNull(zero.get("A"));
+        assertThrows(IllegalArgumentException.class, () -> new ARCCache<>(0));
+        assertThrows(IllegalArgumentException.class, () -> new ARCCache<>(-1));
     }
 
-    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Null key throws exception")
     void testNullKey() {
@@ -178,17 +150,12 @@ class ARCCacheTest {
                 () -> cache.put(null, "1"));
     }
 
-    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Null value throws exception")
     void testNullValue() {
         assertThrows(IllegalArgumentException.class,
                 () -> cache.put("A", null));
     }
-
-    // =========================================================================
-    // Explicit Eviction
-    // =========================================================================
 
     @Test
     @DisplayName("Explicit eviction removes key")
@@ -206,10 +173,6 @@ class ARCCacheTest {
         assertDoesNotThrow(() -> cache.evict("ghost"));
     }
 
-    // =========================================================================
-    // Stats
-    // =========================================================================
-
     @Test
     @DisplayName("Hit count increments")
     void testHitStats() {
@@ -218,7 +181,7 @@ class ARCCacheTest {
         cache.get("A");
         cache.get("A");
 
-        assertEquals(2, cache.getstats().hits());
+        assertEquals(2, cache.getStats().hits());
     }
 
     @Test
@@ -227,7 +190,7 @@ class ARCCacheTest {
         cache.get("X");
         cache.get("Y");
 
-        assertEquals(2, cache.getstats().misses());
+        assertEquals(2, cache.getStats().misses());
     }
 
     @Test
@@ -238,6 +201,64 @@ class ARCCacheTest {
         cache.put("C", "3");
         cache.put("D", "4");
 
-        assertTrue(cache.getstats().evictions() >= 1);
+        assertTrue(cache.getStats().evictions() >= 1);
+    }
+
+    @Test
+    @DisplayName("Repeated hits on a T2 entry do not corrupt list sizes")
+    void testRepeatedHitsKeepSizesConsistent() {
+        ARCCache<String, String> arc = new ARCCache<>(3);
+        arc.put("A", "1");
+        for (int i = 0; i < 100; i++) {
+            arc.get("A");
+        }
+        for (int i = 0; i < 50; i++) {
+            arc.put("k" + i, "v");
+            assertTrue(arc.size() <= 3);
+        }
+        assertEquals("1", arc.get("A"));
+    }
+
+    @Test
+    @DisplayName("A put that hits ghost list B1 grows the recency target")
+    void testGhostHitInB1_increasesTarget() {
+        ARCCache<String, String> arc = new ARCCache<>(2);
+        arc.put("A", "1");
+        arc.get("A");
+        arc.put("B", "2");
+        arc.put("C", "3");
+        assertNull(arc.peek("B"));
+        assertEquals(0, arc.targetRecencySize());
+
+        arc.put("B", "2");
+
+        assertEquals(1, arc.targetRecencySize());
+        assertEquals("2", arc.get("B"));
+        assertEquals(2, arc.size());
+    }
+
+    @Test
+    @DisplayName("Ghost lists stay bounded under a long stream of unique keys")
+    void testGhostListsAreBounded() {
+        ARCCache<String, String> arc = new ARCCache<>(10);
+        for (int i = 0; i < 100_000; i++) {
+            arc.put("key-" + i, "v");
+        }
+        assertEquals(10, arc.size());
+        assertTrue(arc.ghostCount() <= 10, "ghosts: " + arc.ghostCount());
+    }
+
+    @Test
+    @DisplayName("evict() is not counted as an eviction; capacity evictions are")
+    void explicitEvictIsNotCountedAsEviction() {
+        cache.put("A", "1");
+        cache.put("B", "2");
+        cache.evict("A");
+        assertEquals(0, cache.getStats().evictions());
+
+        cache.put("C", "3");
+        cache.put("D", "4");
+        cache.put("E", "5");
+        assertEquals(1, cache.getStats().evictions());
     }
 }

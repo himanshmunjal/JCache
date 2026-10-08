@@ -2,6 +2,8 @@ package com.cache.integration;
 
 import com.cache.client.ClusterCacheClient;
 import com.cache.common.cluster.CacheNode;
+import com.cache.server.CacheServer;
+import com.cache.server.ServerConfig;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
@@ -13,112 +15,37 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Test suite for ClusterCacheClient.
- *
- * ═══════════════════════════════════════════════════════════════════════
- * TESTING STRATEGY
- * ═══════════════════════════════════════════════════════════════════════
- *
- * These are INTEGRATION tests — they require real servers.
- * We use MinimalEchoServer (defined at the bottom of this file), a
- * lightweight TCP server that speaks the JCache wire protocol.
- * Replace MinimalEchoServer.start() with your real CacheServer once
- * that module is complete.
- *
- * WHY NOT MOCK CacheClient?
- * Mocking would only verify that ClusterCacheClient calls the right methods
- * in the right order. It tells us nothing about whether:
- *   - Routing actually lands on the correct node
- *   - Connection pooling correctly borrows/returns connections
- *   - Concurrent access causes data corruption
- *   - The wire protocol parses responses correctly
- * Real servers exercise all of this.
- *
- * PORT ALLOCATION:
- * We use ServerSocket(0) to let the OS assign free ports.
- * This prevents conflicts when multiple test suites run in CI.
- *
- * SERVER LIFECYCLE:
- *   @BeforeAll  — start MinimalEchoServers once (expensive: port bind)
- *   @AfterAll   — stop servers
- *   @BeforeEach — flush caches + create fresh ClusterCacheClient
- *   @AfterEach  — close client
- *
- * TEST CATEGORIES:
- *   1.  Builder validation          — bad args rejected eagerly
- *   2.  Basic get/put/delete        — core operations work
- *   3.  Input validation            — null/space keys rejected
- *   4.  Multi-node routing          — consistent hash works
- *   5.  Distribution verification   — keys spread across nodes
- *   6.  getRoutingTarget            — debug routing method
- *   7.  Topology: addServer         — new nodes added cleanly
- *   8.  Topology: removeServer      — nodes removed cleanly
- *   9.  Operations after removal    — survivor still works
- *   10. flushAll fan-out            — reaches every node
- *   11. clusterStats aggregation    — collects from all nodes
- *   12. Connection pool stats       — pool metrics correct
- *   13. Key distribution            — ring is balanced
- *   14. Concurrent access           — no corruption under load
- *   15. Closed client guard         — ops throw after close()
- *   16. Empty cluster guard         — ops throw with no servers
- */
 @DisplayName("ClusterCacheClient Integration Tests")
-@Execution(ExecutionMode.SAME_THREAD) // servers are shared — run sequentially
+@Execution(ExecutionMode.SAME_THREAD)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ClusterCacheClientTest {
-
-    // -------------------------------------------------------------------------
-    // Test server ports — assigned by OS in @BeforeAll
-    // -------------------------------------------------------------------------
-
+    private static CacheServer server1;
+    private static CacheServer server2;
     private static int serverPort1;
     private static int serverPort2;
 
-    // -------------------------------------------------------------------------
-    // Client under test — recreated fresh per test
-    // -------------------------------------------------------------------------
-
     private ClusterCacheClient client;
 
-    // =========================================================================
-    // @BeforeAll / @AfterAll — server lifecycle (once per class)
-    // =========================================================================
-
-    /**
-     * Starts two MinimalEchoServers on OS-assigned free ports.
-     *
-     * Replace MinimalEchoServer.start() with your real CacheServer once ready:
-     *
-     *   ServerConfig cfg1 = new ServerConfig(serverPort1);
-     *   new Thread(() -> new CacheServer(cfg1).start()).start();
-     *   Thread.sleep(300); // let Netty bind
-     */
     @BeforeAll
-    static void startServers() throws IOException, InterruptedException {
-        serverPort1 = findFreePort();
-        serverPort2 = findFreePort();
-
-        MinimalEchoServer.start(serverPort1);
-        MinimalEchoServer.start(serverPort2);
-
-        // Brief pause — let server threads bind before client connects.
-        Thread.sleep(150);
+    static void startServers() {
+        server1 = startServer();
+        server2 = startServer();
+        serverPort1 = server1.getPort();
+        serverPort2 = server2.getPort();
     }
 
     @AfterAll
     static void stopServers() {
-        MinimalEchoServer.stopAll();
+        server1.shutdown();
+        server2.shutdown();
     }
 
-    // =========================================================================
-    // @BeforeEach / @AfterEach — test isolation
-    // =========================================================================
+    private static CacheServer startServer() {
+        CacheServer server = new CacheServer(ServerConfig.builder().port(0).cacheCapacity(10_000).build());
+        server.startAsync();
+        return server;
+    }
 
-    /**
-     * Creates a fresh 2-node client and flushes both servers before each test.
-     * Flushing ensures no key leaks between tests.
-     */
     @BeforeEach
     void setUp() throws IOException {
         client = ClusterCacheClient.builder()
@@ -127,7 +54,6 @@ class ClusterCacheClientTest {
                 .poolSizePerNode(3)
                 .build();
 
-        // Flush both servers — clean slate for every test.
         Map<String, String> failures = client.flushAll();
         assertTrue(failures.isEmpty(),
                 "Pre-test flush failed on nodes: " + failures);
@@ -140,10 +66,6 @@ class ClusterCacheClientTest {
             client = null;
         }
     }
-
-    // =========================================================================
-    // 1. Builder validation
-    // =========================================================================
 
     @Test
     @Order(1)
@@ -221,17 +143,12 @@ class ClusterCacheClientTest {
     @Order(10)
     @DisplayName("build() throws IOException for unreachable server")
     void testBuilder_unreachableServer_throwsIOException() {
-        // Port 1 is privileged and almost certainly not a cache server.
         assertThrows(IOException.class, () ->
                         ClusterCacheClient.builder()
                                 .addServer("bad", "localhost", 1)
                                 .build(),
                 "build() should throw IOException when server is unreachable");
     }
-
-    // =========================================================================
-    // 2. Basic get / put / delete operations
-    // =========================================================================
 
     @Test
     @Order(20)
@@ -256,14 +173,14 @@ class ClusterCacheClientTest {
         client.put("permanent", "value", 0);
 
         assertEquals("value", client.get("permanent"),
-                "TTL=0 means no expiry — key should be retrievable");
+                "TTL=0 means no expiry: key should be retrievable");
     }
 
     @Test
     @Order(23)
     @DisplayName("put() with positive TTL stores key (accessible before expiry)")
     void testBasic_putWithTTL_accessibleBeforeExpiry() {
-        client.put("session", "token-abc", 60); // 60-second TTL
+        client.put("session", "token-abc", 60);
 
         assertEquals("token-abc", client.get("session"),
                 "Key should be accessible before its TTL expires");
@@ -271,7 +188,7 @@ class ClusterCacheClientTest {
 
     @Test
     @Order(24)
-    @DisplayName("delete() removes a key — get() returns null afterward")
+    @DisplayName("delete() removes a key: get() returns null afterward")
     void testBasic_delete_removesKey() {
         client.put("temp", "value");
         assertNotNull(client.get("temp"), "Key should exist before delete");
@@ -312,10 +229,6 @@ class ClusterCacheClientTest {
         assertEquals("3", client.get("c"));
     }
 
-    // =========================================================================
-    // 3. Input validation
-    // =========================================================================
-
     @Test
     @Order(30)
     @DisplayName("get() throws IllegalArgumentException on null key")
@@ -355,7 +268,6 @@ class ClusterCacheClientTest {
     @Order(35)
     @DisplayName("put() throws on key containing spaces (wire protocol violation)")
     void testValidation_put_keyWithSpaces_throws() {
-        // Space is the wire protocol delimiter — keys with spaces break parsing.
         assertThrows(IllegalArgumentException.class,
                 () -> client.put("key with spaces", "value"));
     }
@@ -375,15 +287,6 @@ class ClusterCacheClientTest {
         assertThrows(IllegalArgumentException.class, () -> client.delete(null));
     }
 
-    // =========================================================================
-    // 4. Multi-node routing — consistent hashing correctness
-    // =========================================================================
-
-    /**
-     * The same key must always route to the same node.
-     * Consistent hashing guarantees determinism: same key + same ring = same node.
-     * We call getRoutingTarget() 20 times and assert all results match the first.
-     */
     @Test
     @Order(40)
     @DisplayName("Same key always routes to the same node (deterministic hashing)")
@@ -398,11 +301,6 @@ class ClusterCacheClientTest {
         }
     }
 
-    /**
-     * Different keys CAN route to different nodes.
-     * This test verifies the ring is actually distributing, not sending everything
-     * to one node. With 2 nodes and enough keys, both nodes must appear at least once.
-     */
     @Test
     @Order(41)
     @DisplayName("Different keys route to different nodes (ring is distributing)")
@@ -419,11 +317,6 @@ class ClusterCacheClientTest {
                         "If only 1 node received keys, the ring is broken. Nodes seen: " + usedNodeIds);
     }
 
-    /**
-     * Core routing correctness: put 200 keys, then get all 200 back.
-     * This verifies that get() routes to the SAME node that put() used.
-     * If routing were inconsistent, put goes to node-A but get tries node-B → null.
-     */
     @Test
     @Order(42)
     @DisplayName("200 put() keys are all retrievable via get() (routing is consistent)")
@@ -454,15 +347,6 @@ class ClusterCacheClientTest {
                         "First few missed keys: " + missedKeys.subList(0, Math.min(5, missedKeys.size())));
     }
 
-    // =========================================================================
-    // 5. Key distribution verification
-    // =========================================================================
-
-    /**
-     * With 200 keys and 2 nodes, each node should handle roughly 100 keys.
-     * We allow a wide tolerance (25%–75%) because hash distribution has variance.
-     * What we're catching is the pathological case where ALL keys go to one node.
-     */
     @Test
     @Order(50)
     @DisplayName("100 keys distribute across both nodes (not all on one)")
@@ -477,7 +361,6 @@ class ClusterCacheClientTest {
             counts.merge(target.getId(), 1, Integer::sum);
         }
 
-        // Each node should have at least 25% of keys.
         int minKeys = total / 4;
         for (Map.Entry<String, Integer> e : counts.entrySet()) {
             assertTrue(e.getValue() >= minKeys,
@@ -486,10 +369,6 @@ class ClusterCacheClientTest {
                             e.getKey(), e.getValue(), total, minKeys, counts));
         }
     }
-
-    // =========================================================================
-    // 6. getRoutingTarget
-    // =========================================================================
 
     @Test
     @Order(60)
@@ -515,24 +394,16 @@ class ClusterCacheClientTest {
     @Order(62)
     @DisplayName("getRoutingTarget() returns same node as actual put/get")
     void testGetRoutingTarget_matchesActualRouting() {
-        // We put a key, then verify getRoutingTarget() points to the node
-        // that actually holds it (proven by a successful get()).
         String key = "routing-target-verification-key";
         client.put(key, "check-value");
 
         CacheNode predicted = client.getRoutingTarget(key);
         assertNotNull(predicted, "Routing target should not be null");
 
-        // get() should return the value — if routing were inconsistent,
-        // predicted node ≠ actual node and get() would return null.
         String result = client.get(key);
         assertEquals("check-value", result,
                 "get() should return the value, confirming routing target is correct");
     }
-
-    // =========================================================================
-    // 7. Topology: addServer
-    // =========================================================================
 
     @Test
     @Order(70)
@@ -565,21 +436,14 @@ class ClusterCacheClientTest {
     @Order(73)
     @DisplayName("addServer() with duplicate ID replaces old connection")
     void testTopology_addServer_duplicateIdReplaces() throws IOException {
-        // Adding node-1 again (same ID, same host:port) should not throw
-        // and node count should remain 2.
         client.addServer("node-1", "localhost", serverPort1);
 
         assertEquals(2, client.getNodeCount(),
                 "Re-adding a node with same ID should replace, not add a third");
 
-        // Operations should still work.
         client.put("post-readd", "works");
         assertEquals("works", client.get("post-readd"));
     }
-
-    // =========================================================================
-    // 8. Topology: removeServer
-    // =========================================================================
 
     @Test
     @Order(80)
@@ -592,7 +456,6 @@ class ClusterCacheClientTest {
         assertEquals(1, client.getNodeCount(),
                 "Node count should be 1 after removing node-2");
 
-        // Re-add for subsequent tests.
         tryAddServer("node-2", "localhost", serverPort2);
     }
 
@@ -618,62 +481,36 @@ class ClusterCacheClientTest {
         tryAddServer("node-2", "localhost", serverPort2);
     }
 
-    // =========================================================================
-    // 9. Operations after node removal (failover / rerouting)
-    // =========================================================================
-
-    /**
-     * After removing one node, the remaining node must still serve requests.
-     * We:
-     *   1. Find which node owns "survivor-key" (it will still exist after removal
-     *      of the OTHER node)
-     *   2. Remove the non-owning node
-     *   3. Verify put/get still works on the surviving node
-     */
     @Test
     @Order(90)
     @DisplayName("Cache operations work after removing one of two nodes")
     void testFailover_operationsAfterRemove() {
         String key = "survivor-key";
 
-        // Find which node owns this key.
         CacheNode owner = client.getRoutingTarget(key);
 
-        // Remove the other node.
         String otherNodeId = owner.getId().equals("node-1") ? "node-2" : "node-1";
         client.removeServer(otherNodeId);
 
-        // Operations on the surviving node should still work.
         client.put(key, "still-alive");
         assertEquals("still-alive", client.get(key),
                 "Cache should work after removing the non-owning node");
 
-        // Restore.
         int otherPort = otherNodeId.equals("node-1") ? serverPort1 : serverPort2;
         tryAddServer(otherNodeId, "localhost", otherPort);
     }
 
-    /**
-     * After removing a node, keys that were owned by it now route to the survivor.
-     * New puts on those keys should work (they go to the survivor now).
-     *
-     * Note: data that was on the removed node is LOST (no replication in this system).
-     * This test verifies that NEW puts after removal route correctly.
-     */
     @Test
     @Order(91)
     @DisplayName("New puts after node removal route to surviving node")
     void testFailover_newPutsAfterRemoval_routeToSurvivor() {
-        // Remove node-2. All keys now route to node-1.
         client.removeServer("node-2");
         assertEquals(1, client.getNodeCount());
 
-        // Put 20 keys — all should go to node-1 (the only node).
         for (int i = 0; i < 20; i++) {
             client.put("post-removal:" + i, "value-" + i);
         }
 
-        // All 20 should be retrievable.
         int misses = 0;
         for (int i = 0; i < 20; i++) {
             if (!"value-" .concat(String.valueOf(i)).equals(client.get("post-removal:" + i))) {
@@ -683,13 +520,8 @@ class ClusterCacheClientTest {
 
         assertEquals(0, misses, misses + "/20 keys missing after single-node operation");
 
-        // Restore.
         tryAddServer("node-2", "localhost", serverPort2);
     }
-
-    // =========================================================================
-    // 10. flushAll — fan-out to all nodes
-    // =========================================================================
 
     @Test
     @Order(100)
@@ -704,14 +536,12 @@ class ClusterCacheClientTest {
     @Order(101)
     @DisplayName("flushAll() removes keys from all nodes")
     void testFlushAll_removesAllKeys() {
-        // Put keys that distribute to both nodes.
         for (int i = 0; i < 20; i++) {
             client.put("flush-test:" + i, "value-" + i);
         }
 
         client.flushAll();
 
-        // All keys should now be gone.
         int found = 0;
         for (int i = 0; i < 20; i++) {
             if (client.get("flush-test:" + i) != null) found++;
@@ -728,10 +558,6 @@ class ClusterCacheClientTest {
         client.close();
         assertThrows(IllegalStateException.class, () -> client.flushAll());
     }
-
-    // =========================================================================
-    // 11. clusterStats aggregation
-    // =========================================================================
 
     @Test
     @Order(110)
@@ -785,10 +611,6 @@ class ClusterCacheClientTest {
         assertThrows(IllegalStateException.class, () -> client.clusterStats());
     }
 
-    // =========================================================================
-    // 12. Connection pool stats
-    // =========================================================================
-
     @Test
     @Order(120)
     @DisplayName("getPoolStats() contains entries for all registered nodes")
@@ -821,7 +643,6 @@ class ClusterCacheClientTest {
     @Order(122)
     @DisplayName("Pool idle + active = pool size (conservation invariant)")
     void testPoolStats_idlePlusActiveEqualsSize() {
-        // Do a put to borrow+return a connection.
         client.put("pool-test", "value");
 
         Map<String, String> poolStats = client.getPoolStats();
@@ -839,10 +660,6 @@ class ClusterCacheClientTest {
                             "If not, a connection was leaked.", entry.getKey(), active, idle, size));
         }
     }
-
-    // =========================================================================
-    // 13. Key distribution (ring balance)
-    // =========================================================================
 
     @Test
     @Order(130)
@@ -875,22 +692,12 @@ class ClusterCacheClientTest {
         for (Map.Entry<String, Double> entry : dist.entrySet()) {
             double pct = entry.getValue();
             assertTrue(pct >= 30.0 && pct <= 70.0,
-                    String.format("Node [%s] owns %.2f%% — too imbalanced. " +
+                    String.format("Node [%s] owns %.2f%%: too imbalanced. " +
                                     "Expected 30-70%%. Full dist: %s",
                             entry.getKey(), pct, dist));
         }
     }
 
-    // =========================================================================
-    // 14. Concurrent access — thread safety
-    // =========================================================================
-
-    /**
-     * 20 threads each put 50 unique keys concurrently.
-     * Verifies:
-     *   - No exceptions thrown (pool exhaustion, NPE, race conditions)
-     *   - All puts complete successfully
-     */
     @Test
     @Order(140)
     @DisplayName("20 concurrent threads performing put() produce no errors")
@@ -929,15 +736,10 @@ class ClusterCacheClientTest {
                 "No errors should occur under concurrent puts");
     }
 
-    /**
-     * Mixed concurrent reads and writes.
-     * Pre-populates 20 keys, then runs 10 threads doing random gets and puts.
-     */
     @Test
     @Order(141)
     @DisplayName("Mixed concurrent gets and puts produce no errors")
     void testConcurrency_mixedGetsPuts_noErrors() throws InterruptedException {
-        // Pre-populate.
         for (int i = 0; i < 20; i++) {
             client.put("base:" + i, "val-" + i);
         }
@@ -979,11 +781,6 @@ class ClusterCacheClientTest {
                 "No errors should occur under concurrent mixed reads/writes");
     }
 
-    /**
-     * Verifies no connection leak under concurrent load.
-     * After all operations complete, active connections should be 0
-     * (all connections returned to pool) and idle should equal pool size.
-     */
     @Test
     @Order(142)
     @DisplayName("No connection leak after concurrent operations")
@@ -1011,21 +808,15 @@ class ClusterCacheClientTest {
         done.await(30, TimeUnit.SECONDS);
         pool.shutdown();
 
-        // After all ops, check pool stats.
-        // All connections should be idle (active=0).
         Map<String, String> poolStats = client.getPoolStats();
         for (Map.Entry<String, String> entry : poolStats.entrySet()) {
             int active = extractInt(entry.getValue(), "active=");
             assertEquals(0, active,
                     "Node [" + entry.getKey() + "] has " + active +
-                            " active connections after all ops completed — possible leak. " +
+                            " active connections after all ops completed: possible leak. " +
                             "Stats: " + entry.getValue());
         }
     }
-
-    // =========================================================================
-    // 15. Closed client guard
-    // =========================================================================
 
     @Test
     @Order(150)
@@ -1070,7 +861,7 @@ class ClusterCacheClientTest {
 
     @Test
     @Order(155)
-    @DisplayName("close() is idempotent — safe to call multiple times")
+    @DisplayName("close() is idempotent: safe to call multiple times")
     void testClosed_closeIsIdempotent() throws IOException {
         ClusterCacheClient c = ClusterCacheClient.builder()
                 .addServer("n", "localhost", serverPort1)
@@ -1078,14 +869,10 @@ class ClusterCacheClientTest {
 
         assertDoesNotThrow(() -> {
             c.close();
-            c.close(); // second call must not throw
-            c.close(); // third call must not throw
+            c.close();
+            c.close();
         });
     }
-
-    // =========================================================================
-    // 16. Empty cluster guard
-    // =========================================================================
 
     @Test
     @Order(160)
@@ -1126,18 +913,6 @@ class ClusterCacheClientTest {
         }
     }
 
-    // =========================================================================
-    // Test utilities
-    // =========================================================================
-
-    /**
-     * Extracts an integer value from a stats string like "active=2 idle=3 size=5".
-     * Used in pool stats tests to verify individual counters.
-     *
-     * @param stats  The stats string.
-     * @param prefix The field prefix, e.g., "active=".
-     * @return The parsed integer value.
-     */
     private static int extractInt(String stats, String prefix) {
         int start = stats.indexOf(prefix);
         if (start == -1) return -1;
@@ -1151,180 +926,11 @@ class ClusterCacheClientTest {
         }
     }
 
-    /**
-     * Attempts to re-add a server, logging failures without throwing.
-     * Used in tests that remove a server and want to restore state for
-     * subsequent tests (even though tearDown() closes the client anyway).
-     */
     private void tryAddServer(String nodeId, String host, int port) {
         try {
             client.addServer(nodeId, host, port);
         } catch (IOException e) {
             System.err.println("[Test] Failed to re-add server [" + nodeId + "]: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Finds a free port on localhost by binding ServerSocket(0) briefly.
-     * The OS assigns an available port number.
-     */
-    private static int findFreePort() throws IOException {
-        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
-            s.setReuseAddress(true);
-            return s.getLocalPort();
-        }
-    }
-
-    // =========================================================================
-    // MinimalEchoServer — wire-protocol-compatible test server
-    // =========================================================================
-
-    /**
-     * A minimal TCP server that speaks the JCache wire protocol.
-     *
-     * PURPOSE:
-     * Allows ClusterCacheClient tests to run WITHOUT requiring the real CacheServer
-     * module to be built. Replace with real CacheServer once available:
-     *
-     *   // In @BeforeAll, replace:
-     *   MinimalEchoServer.start(serverPort1);
-     *   // with:
-     *   ServerConfig cfg = new ServerConfig(serverPort1);
-     *   new Thread(() -> new CacheServer(cfg).start()).start();
-     *   Thread.sleep(300);
-     *
-     * PROTOCOL HANDLED:
-     *   PING           → +PONG
-     *   GET key        → +value  or  -ERR key not found: key
-     *   PUT key val    → +OK  (stores in per-connection ConcurrentHashMap)
-     *   PUT key val N  → +OK  (ignores TTL — no expiry in echo server)
-     *   DELETE key     → +OK
-     *   FLUSH          → +OK  (clears ALL keys across connections via shared store)
-     *   STATS          → +hits:N misses:N evictions:0 size:N hitRate:X.XX%
-     *   unknown        → -ERR unknown command: VERB
-     *
-     * NOTE: The store is SHARED across all connections on the same server instance.
-     * This matches CacheServer behavior where one in-memory cache serves all clients.
-     */
-    static final class MinimalEchoServer {
-
-        private static final List<java.net.ServerSocket> openSockets = new CopyOnWriteArrayList<>();
-
-        static void start(int port) throws IOException {
-            // Shared store for this server instance.
-            // ConcurrentHashMap — safe for multi-client concurrent access.
-            ConcurrentHashMap<String, String> store = new ConcurrentHashMap<>();
-
-            java.net.ServerSocket serverSocket = new java.net.ServerSocket(port);
-            openSockets.add(serverSocket);
-
-            Thread acceptThread = new Thread(() -> {
-                while (!serverSocket.isClosed()) {
-                    try {
-                        java.net.Socket clientSocket = serverSocket.accept();
-                        Thread handler = new Thread(() -> handleClient(clientSocket, store));
-                        handler.setDaemon(true);
-                        handler.start();
-                    } catch (IOException e) {
-                        if (!serverSocket.isClosed()) {
-                            System.err.println("[EchoServer:" + port + "] Accept error: "
-                                    + e.getMessage());
-                        }
-                    }
-                }
-            }, "echo-accept-" + port);
-            acceptThread.setDaemon(true);
-            acceptThread.start();
-        }
-
-        private static void handleClient(
-                java.net.Socket socket,
-                ConcurrentHashMap<String, String> store) {
-
-            try (socket;
-                 java.io.BufferedReader reader = new java.io.BufferedReader(
-                         new java.io.InputStreamReader(socket.getInputStream()));
-                 java.io.PrintWriter writer = new java.io.PrintWriter(
-                         socket.getOutputStream(), true)) {
-
-                // Per-connection hit/miss counters for STATS.
-                long[] hits   = {0};
-                long[] misses = {0};
-
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    String response = dispatch(line.trim(), store, hits, misses);
-                    writer.println(response);
-                }
-
-            } catch (IOException ignored) {
-                // Client disconnected normally.
-            }
-        }
-
-        private static String dispatch(
-                String line,
-                ConcurrentHashMap<String, String> store,
-                long[] hits,
-                long[] misses) {
-
-            if (line.isEmpty()) return "-ERR empty command";
-
-            String[] tokens = line.split("\\s+");
-            String   verb   = tokens[0].toUpperCase();
-
-            switch (verb) {
-
-                case "PING":
-                    return "+PONG";
-
-                case "GET": {
-                    if (tokens.length < 2) return "-ERR missing key";
-                    String val = store.get(tokens[1]);
-                    if (val != null) {
-                        hits[0]++;
-                        return "+" + val;
-                    } else {
-                        misses[0]++;
-                        return "-ERR key not found: " + tokens[1];
-                    }
-                }
-
-                case "PUT": {
-                    if (tokens.length < 3) return "-ERR missing key or value";
-                    // tokens[3] is optional TTL — we accept but ignore it.
-                    store.put(tokens[1], tokens[2]);
-                    return "+OK";
-                }
-
-                case "DELETE": {
-                    if (tokens.length < 2) return "-ERR missing key";
-                    store.remove(tokens[1]);
-                    return "+OK";
-                }
-
-                case "FLUSH":
-                    store.clear();
-                    return "+OK";
-
-                case "STATS": {
-                    long total   = hits[0] + misses[0];
-                    double rate  = total == 0 ? 0.0 : (double) hits[0] / total * 100.0;
-                    return String.format(
-                            "+hits:%d misses:%d evictions:0 size:%d hitRate:%.2f%%",
-                            hits[0], misses[0], store.size(), rate);
-                }
-
-                default:
-                    return "-ERR unknown command: " + tokens[0];
-            }
-        }
-
-        static void stopAll() {
-            for (java.net.ServerSocket ss : openSockets) {
-                try { ss.close(); } catch (IOException ignored) {}
-            }
-            openSockets.clear();
         }
     }
 }

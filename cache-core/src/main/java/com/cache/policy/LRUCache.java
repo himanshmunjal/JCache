@@ -8,123 +8,105 @@ import com.cache.core.Node;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * LRU (Least Recently Used) cache implementation.
+ * Least-recently-used cache. A hash map gives O(1) lookup and a doubly linked
+ * list keeps entries in access order, so every operation is O(1).
  *
- * Algorithm:
- *  - HashMap gives O(1) key → node lookup.
- *  - DoublyLinkedList maintains access order (front = most recent).
- *  - On get:  move node to front → O(1)
- *  - On put:  if exists, update + move to front; if new, add to front.
- *             If over capacity, evict the tail node.
- *  - On evict: remove from both map and list → O(1).
+ * <p>Entries may optionally carry a TTL via {@link #put(Object, Object, long)};
+ * expired entries are dropped lazily when they are next read.
  *
- * Not thread-safe. Use ConcurrentLRUCache (Day 12) for concurrent access.
+ * <p>Not thread-safe.
  *
- * @param <K> Key type
- * @param <V> Value type
+ * @param <K> key type
+ * @param <V> value type
  */
 public class LRUCache<K, V> implements Cache<K, V>, EvictionPolicy<K> {
 
     private final int capacity;
-    private final Map<K, Node<K, V>>   map;
-    private final DoublyLinkedList<K, V> list;
+    private final Map<K, Node<K, V>> map;
+    private final DoublyLinkedList<K, V> list = new DoublyLinkedList<>();
 
-    // Stats counters — AtomicLong now so we don't have to change the field
-    // type when we add thread safety later
-    private final AtomicLong hits      = new AtomicLong(0);
-    private final AtomicLong misses    = new AtomicLong(0);
-    private final AtomicLong evictions = new AtomicLong(0);
+    private long hits;
+    private long misses;
+    private long evictions;
 
+    /**
+     * Creates an empty cache.
+     *
+     * @param capacity maximum number of entries, must be positive
+     */
     public LRUCache(int capacity) {
         if (capacity <= 0) {
             throw new IllegalArgumentException("Capacity must be > 0, got: " + capacity);
         }
         this.capacity = capacity;
-        this.map      = new HashMap<>(capacity);
-        this.list     = new DoublyLinkedList<>();
+        this.map = new HashMap<>(capacity);
     }
 
-    // Cache interface
-
-    /**
-     * Returns the value for key, or null if absent/expired.
-     * Moves the accessed node to the front of the list (marks it most-recent).
-     * O(1).
-     */
     @Override
     public V get(K key) {
+        requireKey(key);
         Node<K, V> node = map.get(key);
-
         if (node == null) {
-            misses.incrementAndGet();
+            misses++;
             return null;
         }
-
-        // Lazy TTL eviction — treat expired nodes as misses
         if (node.isExpired()) {
             evict(key);
-            misses.incrementAndGet();
+            misses++;
             return null;
         }
-
-        hits.incrementAndGet();
-        onAccess(key);           // EvictionPolicy hook — moves node to front
+        hits++;
+        list.moveToFront(node);
         return node.value;
     }
 
-    /**
-     * Inserts or updates a key-value pair with no TTL.
-     * If the cache is at capacity, the least-recently-used entry is evicted first.
-     * O(1).
-     */
     @Override
     public void put(K key, V value) {
-        put(key, value, -1);
+        put(key, value, Node.NO_EXPIRY);
     }
 
     /**
-     * Inserts or updates a key-value pair with a TTL in milliseconds.
-     * Pass ttlMillis = -1 for no expiry.
-     * O(1).
+     * Stores a value that expires after {@code ttlMillis}.
+     *
+     * @param key       the key
+     * @param value     the value
+     * @param ttlMillis time to live in milliseconds, or {@link Node#NO_EXPIRY}
      */
     public void put(K key, V value, long ttlMillis) {
-        if (map.containsKey(key)) {
-            // Update existing node in place — cheaper than remove + re-add
-            Node<K, V> node = map.get(key);
-            node.value      = value;
-            node.expiryTime = (ttlMillis == -1) ? -1
-                    : System.currentTimeMillis() + ttlMillis;
-            onAccess(key);   // Treat update as an access — moves to front
+        requireKey(key);
+        requireValue(value);
+
+        Node<K, V> existing = map.get(key);
+        if (existing != null) {
+            existing.value = value;
+            existing.expireAfter(ttlMillis);
+            list.moveToFront(existing);
             return;
         }
 
-        // Evict LRU entry before inserting if at capacity
         if (map.size() >= capacity) {
-            evictLRU();
+            evict();
         }
-
-        Node<K, V> newNode = (ttlMillis == -1) ? new Node<>(key, value)
-                : new Node<>(key, value, ttlMillis);
-        map.put(key, newNode);
-        list.addToFront(newNode);
-        onInsert(key);       // EvictionPolicy hook
+        Node<K, V> node = new Node<>(key, value);
+        node.expireAfter(ttlMillis);
+        map.put(key, node);
+        list.addToFront(node);
     }
 
-    /**
-     * Explicitly removes a key from the cache.
-     * No-op if the key does not exist.
-     * O(1).
-     */
     @Override
     public void evict(K key) {
         Node<K, V> node = map.remove(key);
         if (node != null) {
             list.remove(node);
-            evictions.incrementAndGet();
         }
+    }
+
+    @Override
+    public V peek(K key) {
+        Node<K, V> node = map.get(key);
+        return node == null || node.isExpired() ? null : node.value;
     }
 
     @Override
@@ -133,17 +115,16 @@ public class LRUCache<K, V> implements Cache<K, V>, EvictionPolicy<K> {
     }
 
     @Override
-    public CacheStats getstats() {
-        long h = hits.get();
-        long m = misses.get();
-        long total = h + m;
-        double hitRate = (total == 0) ? 0.0 : (double) h / total;
-        return new CacheStats(h, m, evictions.get(), hitRate);
+    public CacheStats getStats() {
+        return CacheStats.of(hits, misses, evictions);
     }
 
-    // EvictionPolicy interface
+    @Override
+    public void clear() {
+        map.clear();
+        list.clear();
+    }
 
-    /** Called on every successful get — moves node to front. */
     @Override
     public void onAccess(K key) {
         Node<K, V> node = map.get(key);
@@ -153,41 +134,35 @@ public class LRUCache<K, V> implements Cache<K, V>, EvictionPolicy<K> {
     }
 
     @Override
-    public void clear() {
-        map.clear();
-        list.clear();
-    }
-
-    /** Called on every new insert — node is already at front, nothing to do. */
-    @Override
     public void onInsert(K key) {
-        // addToFront already handled in put()
+        // put() already links new nodes at the front.
     }
 
-    /** Not part of the EvictionPolicy interface — returns the evicted key. */
     @Override
     public K evict() {
-        Node<K, V> lru = list.peekLast();
-        if (lru == null) return null;
-        evict(lru.key);
+        Node<K, V> lru = list.removeLast();
+        if (lru == null) {
+            return null;
+        }
+        map.remove(lru.key);
+        evictions++;
         return lru.key;
     }
 
-    // Internal
-
-    private void evictLRU() {
-        Node<K, V> lru = list.removeLast();
-        if (lru != null) {
-            map.remove(lru.key);
-            evictions.incrementAndGet();
-        }
-    }
-
-    //  Debug
-
-    /** Returns the current order of keys from most-recent to least-recent. */
     @Override
     public String toString() {
         return "LRUCache(capacity=" + capacity + ", size=" + size() + ") " + list;
+    }
+
+    static void requireKey(Object key) {
+        if (key == null) {
+            throw new IllegalArgumentException("Key must not be null");
+        }
+    }
+
+    static void requireValue(Object value) {
+        if (value == null) {
+            throw new IllegalArgumentException("Value must not be null");
+        }
     }
 }

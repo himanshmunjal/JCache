@@ -7,17 +7,12 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @DisplayName("LFUCache Tests")
 class LFUCacheTest {
-
     private Cache<String, String> cache;
 
     @BeforeEach
     void setUp() {
         cache = new LFUCache<>(3);
     }
-
-    // =========================================================================
-    // Basic Put/Get
-    // =========================================================================
 
     @Test
     @DisplayName("Basic put/get works")
@@ -41,10 +36,6 @@ class LFUCacheTest {
 
         assertEquals(2, cache.size());
     }
-
-    // =========================================================================
-    // LFU Eviction
-    // =========================================================================
 
     @Test
     @DisplayName("Least frequently used key is evicted")
@@ -95,10 +86,6 @@ class LFUCacheTest {
         assertNull(cache.get("B"), "B should be evicted first among LFU ties");
     }
 
-    // =========================================================================
-    // Update Existing Keys
-    // =========================================================================
-
     @Test
     @DisplayName("Updating existing key changes value")
     void testUpdateExistingKey() {
@@ -117,10 +104,6 @@ class LFUCacheTest {
         assertEquals(1, cache.size());
     }
 
-    // =========================================================================
-    // Capacity Edge Cases
-    // =========================================================================
-
     @Test
     @DisplayName("Capacity one behaves correctly")
     void testCapacityOne() {
@@ -133,23 +116,13 @@ class LFUCacheTest {
         assertEquals("2", tiny.get("B"));
     }
 
-    @Disabled("Temporarily disabled during server integration")
     @Test
-    @DisplayName("Capacity zero behaves gracefully")
+    @DisplayName("Capacity zero is rejected")
     void testCapacityZero() {
-        Cache<String, String> zero = new LFUCache<>(0);
-
-        zero.put("A", "1");
-
-        assertNull(zero.get("A"));
-        assertEquals(0, zero.size());
+        assertThrows(IllegalArgumentException.class, () -> new LFUCache<>(0));
+        assertThrows(IllegalArgumentException.class, () -> new LFUCache<>(-1));
     }
 
-    // =========================================================================
-    // Null Handling
-    // =========================================================================
-
-    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Null key throws exception")
     void testNullKey() {
@@ -157,17 +130,12 @@ class LFUCacheTest {
                 () -> cache.put(null, "1"));
     }
 
-    @Disabled("Temporarily disabled during server integration")
     @Test
     @DisplayName("Null value throws exception")
     void testNullValue() {
         assertThrows(IllegalArgumentException.class,
                 () -> cache.put("A", null));
     }
-
-    // =========================================================================
-    // Explicit Eviction
-    // =========================================================================
 
     @Test
     @DisplayName("Explicit eviction removes key")
@@ -184,10 +152,6 @@ class LFUCacheTest {
     void testEvictNonexistentKey() {
         assertDoesNotThrow(() -> cache.evict("ghost"));
     }
-
-    // =========================================================================
-    // Stress Behaviour
-    // =========================================================================
 
     @Test
     @DisplayName("Frequent accesses protect key from eviction")
@@ -213,7 +177,7 @@ class LFUCacheTest {
         cache.put("C", "3");
         cache.put("D", "4");
 
-        assertTrue(cache.getstats().evictions() >= 1);
+        assertTrue(cache.getStats().evictions() >= 1);
     }
 
     @Test
@@ -224,7 +188,7 @@ class LFUCacheTest {
         cache.get("A");
         cache.get("A");
 
-        assertEquals(2, cache.getstats().hits());
+        assertEquals(2, cache.getStats().hits());
     }
 
     @Test
@@ -233,6 +197,61 @@ class LFUCacheTest {
         cache.get("missing");
         cache.get("missing2");
 
-        assertEquals(2, cache.getstats().misses());
+        assertEquals(2, cache.getStats().misses());
+    }
+
+    @Test
+    @DisplayName("A key read more than 10,000 times can still be evicted later")
+    void testHeavilyReadKey_doesNotBreakEviction() {
+        LFUCache<String, String> lfu = new LFUCache<>(3);
+        lfu.put("hot", "1");
+        for (int i = 0; i < 25_000; i++) {
+            lfu.get("hot");
+        }
+        for (int i = 0; i < 100; i++) {
+            lfu.put("k" + i, "v");
+        }
+        assertEquals(3, lfu.size());
+        assertEquals("1", lfu.get("hot"));
+    }
+
+    @Test
+    @DisplayName("Evicting the only lowest-frequency key keeps eviction working")
+    void testExplicitEvictOfMinFrequencyKey() {
+        LFUCache<String, String> lfu = new LFUCache<>(2);
+        lfu.put("a", "1");
+        lfu.put("b", "2");
+        lfu.get("b");
+        lfu.evict("a");
+        assertNotNull(lfu.evict());
+        lfu.put("c", "3");
+        lfu.put("d", "4");
+        lfu.put("e", "5");
+        assertEquals(2, lfu.size());
+    }
+
+    @Test
+    @DisplayName("Ties at the lowest frequency evict the least recently used key")
+    void testTieBreakIsLeastRecentlyUsed() {
+        LFUCache<String, String> lfu = new LFUCache<>(2);
+        lfu.put("old", "1");
+        lfu.put("new", "2");
+        lfu.put("third", "3");
+        assertNull(lfu.peek("old"));
+        assertEquals("2", lfu.peek("new"));
+    }
+
+    @Test
+    @DisplayName("evict() is not counted as an eviction; capacity evictions are")
+    void explicitEvictIsNotCountedAsEviction() {
+        cache.put("A", "1");
+        cache.put("B", "2");
+        cache.evict("A");
+        assertEquals(0, cache.getStats().evictions());
+
+        cache.put("C", "3");
+        cache.put("D", "4");
+        cache.put("E", "5");
+        assertEquals(1, cache.getStats().evictions());
     }
 }

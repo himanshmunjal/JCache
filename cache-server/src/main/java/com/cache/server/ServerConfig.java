@@ -1,374 +1,275 @@
 package com.cache.server;
 
 import com.cache.api.CachePolicyType;
-import com.cache.persistence.PersistenceConfig;
 
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Properties;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
- * ServerConfig is the single source of truth for all CacheServer configuration.
+ * Immutable server configuration.
  *
- * DESIGN — WHY ONE CONFIG CLASS?
- *   Every tunable value lives here. CacheServer, CacheServerHandler,
- *   ConnectionManager, and the persistence layer all read from this object.
- *   This means:
- *     - No magic numbers scattered across classes
- *     - One place to look when tuning performance
- *     - Easy to serialize for "what config is this server running?" diagnostics
- *     - Simple to mock in tests (just construct with different values)
+ * <p>Values can come from a properties file, environment variables or
+ * command-line flags. {@link CacheServer#main} applies them in that order, so
+ * later sources win:
+ * <pre>
+ * built-in defaults &lt; properties file &lt; environment &lt; command line
+ * </pre>
  *
- * TWO WAYS TO BUILD A ServerConfig:
- *
- *   1. Builder pattern (programmatic — used in tests and CacheServer.main()):
- *        ServerConfig config = ServerConfig.builder()
- *            .port(6379)
- *            .cacheCapacity(50_000)
- *            .evictionPolicy(CachePolicyType.LRU)
- *            .build();
- *
- *   2. Properties file (for production deployments):
- *        ServerConfig config = ServerConfig.fromProperties("jcache.properties");
- *
- *      jcache.properties example:
- *        server.port=6379
- *        server.boss.threads=1
- *        server.worker.threads=8
- *        server.max.connections=1000
- *        cache.capacity=100000
- *        cache.policy=LRU
- *        cache.sweep.interval.ms=500
- *        persistence.enabled=false
- *        persistence.snapshot.path=./jcache.snapshot
- *        server.verbose=false
- *
- * IMMUTABILITY:
- *   All fields are final after construction via the Builder.
- *   ServerConfig is safe to share across all Netty threads without
- *   synchronization — Netty worker threads read it concurrently.
- *
- * DEFAULTS:
- *   All defaults mirror Redis defaults where applicable (port 6379,
- *   no persistence by default) so the server is usable out of the box
- *   without any configuration.
+ * <table>
+ *   <caption>Settings</caption>
+ *   <tr><th>Property</th><th>Environment variable</th><th>Default</th></tr>
+ *   <tr><td>server.port</td><td>JCACHE_PORT</td><td>6379</td></tr>
+ *   <tr><td>server.boss.threads</td><td>JCACHE_BOSS_THREADS</td><td>1</td></tr>
+ *   <tr><td>server.worker.threads</td><td>JCACHE_THREADS</td><td>8</td></tr>
+ *   <tr><td>server.max.connections</td><td>JCACHE_MAX_CONNECTIONS</td><td>1000</td></tr>
+ *   <tr><td>server.rate.limit</td><td>JCACHE_RATE_LIMIT</td><td>0 (off)</td></tr>
+ *   <tr><td>server.rate.limit.burst</td><td>JCACHE_RATE_LIMIT_BURST</td><td>0 (same as rate)</td></tr>
+ *   <tr><td>server.verbose</td><td>JCACHE_VERBOSE</td><td>false</td></tr>
+ *   <tr><td>cache.capacity</td><td>JCACHE_CAPACITY</td><td>10000</td></tr>
+ *   <tr><td>cache.policy</td><td>JCACHE_POLICY</td><td>LRU</td></tr>
+ *   <tr><td>cache.segments</td><td>JCACHE_SEGMENTS</td><td>16</td></tr>
+ *   <tr><td>cache.default.ttl</td><td>JCACHE_DEFAULT_TTL</td><td>0 (no expiry)</td></tr>
+ *   <tr><td>cache.sweep.interval.ms</td><td>JCACHE_SWEEP_INTERVAL</td><td>500</td></tr>
+ *   <tr><td>persistence.enabled</td><td>JCACHE_PERSISTENCE_ENABLED</td><td>false</td></tr>
+ *   <tr><td>persistence.snapshot.path</td><td>JCACHE_SNAPSHOT_PATH</td><td>./jcache-data</td></tr>
+ *   <tr><td>persistence.snapshot.interval.ms</td><td>JCACHE_SNAPSHOT_INTERVAL_MS</td><td>300000</td></tr>
+ * </table>
  */
 public final class ServerConfig {
 
-    // =========================================================================
-    // Default values — mirrors Redis defaults where applicable
-    // =========================================================================
-
-    /** Default TCP port. 6379 matches Redis so tooling works without reconfiguration. */
-    public static final int     DEFAULT_PORT                = 6379;
-
-    /**
-     * Boss threads accept incoming TCP connections.
-     * 1 is always sufficient — the OS queues incoming SYNs in the backlog.
-     * Multiple boss threads only help if you are binding to multiple ports.
-     */
-    public static final int     DEFAULT_BOSS_THREADS        = 1;
-
-    /**
-     * Worker threads handle I/O (read/write) for all accepted connections.
-     * Netty default is 2 x CPU cores. We default to 8 which fits most
-     * development machines and small production deployments.
-     * Tune upward if CPU utilization is high under load.
-     */
-    public static final int     DEFAULT_WORKER_THREADS      = 8;
-
-    /**
-     * Maximum concurrent client connections.
-     * 1000 is conservative — Redis defaults to 10,000.
-     * Increase for production workloads; lower for resource-constrained environments.
-     */
-    public static final int     DEFAULT_MAX_CONNECTIONS     = 1000;
-
-    /**
-     * Maximum number of key-value pairs in the cache.
-     * When capacity is reached, the eviction policy removes one entry.
-     * 10,000 entries at ~100 bytes each = ~1MB — safe default.
-     */
-    public static final int     DEFAULT_CACHE_CAPACITY      = 10_000;
-
-    /**
-     * Default eviction policy. LRU is the most widely understood and
-     * appropriate for most workloads with temporal locality.
-     */
-    public static final CachePolicyType DEFAULT_POLICY      = CachePolicyType.LRU;
-
-    /**
-     * How often the TTL background sweeper runs in milliseconds.
-     * 500ms means an expired key is cleaned up within 500ms of expiry
-     * (lazy eviction handles it immediately on reads, sweeper handles the rest).
-     */
-    public static final long    DEFAULT_SWEEP_INTERVAL_MS   = 500L;
-
-    /**
-     * Persistence off by default — matches Redis default (RDB/AOF disabled).
-     * Enable for "durable cache" deployments where data must survive restart.
-     */
+    /** Default TCP port, the same as Redis. */
+    public static final int DEFAULT_PORT = 6379;
+    /** Default number of acceptor threads. */
+    public static final int DEFAULT_BOSS_THREADS = 1;
+    /** Default number of I/O threads. */
+    public static final int DEFAULT_WORKER_THREADS = 8;
+    /** Default connection limit. */
+    public static final int DEFAULT_MAX_CONNECTIONS = 1000;
+    /** Default number of entries. */
+    public static final int DEFAULT_CACHE_CAPACITY = 10_000;
+    /** Default eviction policy. */
+    public static final CachePolicyType DEFAULT_POLICY = CachePolicyType.LRU;
+    /** Default number of lock segments. */
+    public static final int DEFAULT_SEGMENTS = 16;
+    /** Default TTL in seconds; 0 means keys do not expire. */
+    public static final long DEFAULT_TTL_SECONDS = 0;
+    /** Default interval of the TTL sweeper. */
+    public static final long DEFAULT_SWEEP_INTERVAL_MS = 500L;
+    /** Persistence is off unless enabled. */
     public static final boolean DEFAULT_PERSISTENCE_ENABLED = false;
+    /** Default data directory. */
+    public static final String DEFAULT_SNAPSHOT_PATH = "./jcache-data";
+    /** Default interval between snapshots. */
+    public static final long DEFAULT_SNAPSHOT_INTERVAL_MS = 300_000L;
+    /** Commands per second per connection; 0 turns rate limiting off. */
+    public static final int DEFAULT_RATE_LIMIT = 0;
+    /** Burst size per connection; 0 means the same as the rate. */
+    public static final int DEFAULT_RATE_LIMIT_BURST = 0;
+    /** Per-command logging is off unless enabled. */
+    public static final boolean DEFAULT_VERBOSE = false;
 
-    /** Default path for snapshot files when persistence is enabled. */
-    public static final String  DEFAULT_SNAPSHOT_PATH       = "./jcache.snapshot";
-
-    /**
-     * Verbose logging off by default.
-     * When true, every command received and connection event is logged to stdout.
-     * Useful during development; too noisy for production.
-     */
-    public static final boolean DEFAULT_VERBOSE             = false;
-
-    // =========================================================================
-    // Configuration fields — all final, set once by Builder
-    // =========================================================================
-
-    /** TCP port the server listens on. */
-    private final int             port;
-
-    /** Number of Netty boss threads (accept new connections). */
-    private final int             bossThreads;
-
-    /** Number of Netty worker threads (handle I/O for accepted connections). */
-    private final int             workerThreads;
-
-    /** Maximum number of concurrent client connections before rejection. */
-    private final int             maxConnections;
-
-    /** Maximum number of entries in the cache before eviction fires. */
-    private final int             cacheCapacity;
-
-    /** Which eviction policy to use: LRU, LFU, ARC, or FIFO. */
+    private final int port;
+    private final int bossThreads;
+    private final int workerThreads;
+    private final int maxConnections;
+    private final int rateLimitPerSecond;
+    private final int rateLimitBurst;
+    private final int cacheCapacity;
     private final CachePolicyType evictionPolicy;
+    private final int segments;
+    private final long defaultTtlSeconds;
+    private final long sweepIntervalMs;
+    private final boolean persistenceEnabled;
+    private final String snapshotPath;
+    private final long snapshotIntervalMs;
+    private final boolean verbose;
 
-    /** How often the TTL sweeper thread runs, in milliseconds. */
-    private final long            sweepIntervalMs;
-
-    /** Whether to persist cache state to disk (AOF log + snapshots). */
-    private final boolean         persistenceEnabled;
-
-    /** Filesystem path for snapshot files when persistence is enabled. */
-    private final String          snapshotPath;
-
-    /**
-     * When true, every received command and connection lifecycle event
-     * is logged to stdout. Set to false in production.
-     */
-    private final boolean         verbose;
-
-    // =========================================================================
-    // Private constructor — only the Builder or fromProperties() call this
-    // =========================================================================
-
-    /**
-     * Private constructor. Use {@link Builder} or {@link #fromProperties(String)}.
-     */
-    private ServerConfig(Builder builder) {
-        this.port               = builder.port;
-        this.bossThreads        = builder.bossThreads;
-        this.workerThreads      = builder.workerThreads;
-        this.maxConnections     = builder.maxConnections;
-        this.cacheCapacity      = builder.cacheCapacity;
-        this.evictionPolicy     = builder.evictionPolicy;
-        this.sweepIntervalMs    = builder.sweepIntervalMs;
-        this.persistenceEnabled = builder.persistenceEnabled;
-        this.snapshotPath       = builder.snapshotPath;
-        this.verbose            = builder.verbose;
+    private ServerConfig(Builder b) {
+        this.port = b.port;
+        this.bossThreads = b.bossThreads;
+        this.workerThreads = b.workerThreads;
+        this.maxConnections = b.maxConnections;
+        this.rateLimitPerSecond = b.rateLimitPerSecond;
+        this.rateLimitBurst = b.rateLimitBurst;
+        this.cacheCapacity = b.cacheCapacity;
+        this.evictionPolicy = b.evictionPolicy;
+        this.segments = b.segments;
+        this.defaultTtlSeconds = b.defaultTtlSeconds;
+        this.sweepIntervalMs = b.sweepIntervalMs;
+        this.persistenceEnabled = b.persistenceEnabled;
+        this.snapshotPath = b.snapshotPath;
+        this.snapshotIntervalMs = b.snapshotIntervalMs;
+        this.verbose = b.verbose;
     }
 
-    // =========================================================================
-    // Static factory methods
-    // =========================================================================
-
-    /**
-     * Returns a Builder pre-populated with all default values.
-     * Call .build() immediately for a fully-default config, or chain setter
-     * calls before .build() to override specific values.
-     *
-     * Example:
-     *   ServerConfig config = ServerConfig.builder().port(6380).build();
-     *
-     * @return A new Builder with default values.
-     */
+    /** @return a builder initialised with the defaults */
     public static Builder builder() {
         return new Builder();
     }
 
-    /**
-     * Returns a ServerConfig with all default values.
-     * Equivalent to ServerConfig.builder().build().
-     * Useful for tests and quick-start scenarios.
-     *
-     * @return Default ServerConfig instance.
-     */
+    /** @return the default configuration */
     public static ServerConfig defaults() {
-        return new Builder().build();
+        return builder().build();
     }
 
     /**
-     * Loads a ServerConfig from a .properties file on the filesystem.
+     * Reads a properties file on top of the defaults.
      *
-     * All properties are optional — any property not in the file falls back
-     * to the default value. This means a partial properties file is valid.
-     *
-     * Property keys:
-     *   server.port               (int,     default: 6379)
-     *   server.boss.threads       (int,     default: 1)
-     *   server.worker.threads     (int,     default: 8)
-     *   server.max.connections    (int,     default: 1000)
-     *   server.verbose            (boolean, default: false)
-     *   cache.capacity            (int,     default: 10000)
-     *   cache.policy              (string,  default: LRU)
-     *   cache.sweep.interval.ms   (long,    default: 500)
-     *   persistence.enabled       (boolean, default: false)
-     *   persistence.snapshot.path (string,  default: ./jcache.snapshot)
-     *
-     * @param propertiesFilePath Absolute or relative path to the .properties file.
-     * @return Populated ServerConfig, with defaults for any missing properties.
-     * @throws RuntimeException if the file cannot be read (wraps IOException).
+     * @param path path of the file
+     * @return the configuration
      */
-    public static ServerConfig fromProperties(String propertiesFilePath) {
-        Properties props = new Properties();
-
-        try (InputStream in = new FileInputStream(propertiesFilePath)) {
-            props.load(in);
-        } catch (IOException e) {
-            throw new RuntimeException(
-                    "Failed to load ServerConfig from: " + propertiesFilePath, e
-            );
-        }
-
-        Builder b = new Builder();
-
-        b.port(parseInt(props, "server.port", DEFAULT_PORT));
-        b.bossThreads(parseInt(props, "server.boss.threads", DEFAULT_BOSS_THREADS));
-        b.workerThreads(parseInt(props, "server.worker.threads", DEFAULT_WORKER_THREADS));
-        b.maxConnections(parseInt(props, "server.max.connections", DEFAULT_MAX_CONNECTIONS));
-        b.verbose(parseBoolean(props, "server.verbose", DEFAULT_VERBOSE));
-
-        b.cacheCapacity(parseInt(props, "cache.capacity", DEFAULT_CACHE_CAPACITY));
-        b.sweepIntervalMs(parseLong(props, "cache.sweep.interval.ms", DEFAULT_SWEEP_INTERVAL_MS));
-
-        // Parse eviction policy — convert string to enum, default to LRU on invalid value
-        String policyStr = props.getProperty("cache.policy", DEFAULT_POLICY.name());
-        try {
-            b.evictionPolicy(CachePolicyType.valueOf(policyStr.toUpperCase()));
-        } catch (IllegalArgumentException e) {
-            System.err.printf(
-                    "[ServerConfig] Unknown policy '%s', defaulting to LRU%n", policyStr);
-            b.evictionPolicy(CachePolicyType.LRU);
-        }
-
-        b.persistenceEnabled(parseBoolean(props, "persistence.enabled", DEFAULT_PERSISTENCE_ENABLED));
-        b.snapshotPath(props.getProperty("persistence.snapshot.path", DEFAULT_SNAPSHOT_PATH));
-
-        return b.build();
+    public static ServerConfig fromProperties(String path) {
+        return builder().applyProperties(path).build();
     }
 
-    // =========================================================================
-    // Getters — all read-only
-    // =========================================================================
-
-    /** @return TCP port the server listens on (1-65535). */
-    public int getPort() { return port; }
-
-    /** @return Number of Netty boss threads (usually 1). */
-    public int getBossThreads() { return bossThreads; }
-
-    /** @return Number of Netty worker threads for I/O. */
-    public int getWorkerThreads() { return workerThreads; }
-
-    /** @return Maximum concurrent client connections before rejection. */
-    public int getMaxConnections() { return maxConnections; }
-
-    /** @return Maximum number of entries before eviction fires. */
-    public int getCacheCapacity() { return cacheCapacity; }
-
-    /** @return The eviction policy in use (LRU/LFU/ARC/FIFO). */
-    public CachePolicyType getEvictionPolicy() { return evictionPolicy; }
-
-    /** @return How often the TTL background sweeper runs (milliseconds). */
-    public long getSweepIntervalMs() { return sweepIntervalMs; }
-
-    /** @return Whether AOF + snapshot persistence is enabled. */
-    public boolean isPersistenceEnabled() { return persistenceEnabled; }
-
-    /** @return Filesystem path for snapshot files. */
-    public String getSnapshotPath() { return snapshotPath; }
-
     /**
-     * Whether verbose command/connection logging is enabled.
-     * Read by CacheServerHandler and ConnectionManager for per-event logging.
+     * Reads {@code JCACHE_*} environment variables on top of the defaults.
      *
-     * @return true if verbose logging is on.
+     * @return the configuration
      */
-    public boolean isVerbose() { return verbose; }
+    public static ServerConfig fromEnvironment() {
+        return builder().applyEnvironment(System.getenv()).build();
+    }
 
-    // =========================================================================
-    // toString — logged by CacheServer on startup
-    // =========================================================================
+    /** @return a builder holding this configuration's values */
+    public Builder toBuilder() {
+        return new Builder()
+                .port(port)
+                .bossThreads(bossThreads)
+                .workerThreads(workerThreads)
+                .maxConnections(maxConnections)
+                .rateLimitPerSecond(rateLimitPerSecond)
+                .rateLimitBurst(rateLimitBurst)
+                .cacheCapacity(cacheCapacity)
+                .evictionPolicy(evictionPolicy)
+                .segments(segments)
+                .defaultTtlSeconds(defaultTtlSeconds)
+                .sweepIntervalMs(sweepIntervalMs)
+                .persistenceEnabled(persistenceEnabled)
+                .snapshotPath(snapshotPath)
+                .snapshotIntervalMs(snapshotIntervalMs)
+                .verbose(verbose);
+    }
 
-    /**
-     * Returns a human-readable summary of all config values.
-     * Logged by CacheServer on startup so operators know exactly what is running.
-     *
-     * @return Multi-field string representation.
-     */
+    /** @return the TCP port; 0 means any free port */
+    public int getPort() {
+        return port;
+    }
+
+    /** @return number of acceptor threads */
+    public int getBossThreads() {
+        return bossThreads;
+    }
+
+    /** @return number of I/O threads */
+    public int getWorkerThreads() {
+        return workerThreads;
+    }
+
+    /** @return maximum number of open client connections */
+    public int getMaxConnections() {
+        return maxConnections;
+    }
+
+    /** @return commands per second allowed on each connection; 0 if unlimited */
+    public int getRateLimitPerSecond() {
+        return rateLimitPerSecond;
+    }
+
+    /** @return commands a connection may send at once before the rate applies */
+    public int getRateLimitBurst() {
+        return rateLimitBurst > 0 ? rateLimitBurst : rateLimitPerSecond;
+    }
+
+    /** @return maximum number of cached entries */
+    public int getCacheCapacity() {
+        return cacheCapacity;
+    }
+
+    /** @return the eviction policy */
+    public CachePolicyType getEvictionPolicy() {
+        return evictionPolicy;
+    }
+
+    /** @return number of lock segments */
+    public int getSegments() {
+        return segments;
+    }
+
+    /** @return TTL in seconds applied to writes that do not give one; 0 for none */
+    public long getDefaultTtlSeconds() {
+        return defaultTtlSeconds;
+    }
+
+    /** @return interval of the TTL sweeper */
+    public long getSweepIntervalMs() {
+        return sweepIntervalMs;
+    }
+
+    /** @return whether snapshot and AOF persistence is enabled */
+    public boolean isPersistenceEnabled() {
+        return persistenceEnabled;
+    }
+
+    /** @return the data directory used for persistence */
+    public String getSnapshotPath() {
+        return snapshotPath;
+    }
+
+    /** @return interval between snapshots */
+    public long getSnapshotIntervalMs() {
+        return snapshotIntervalMs;
+    }
+
+    /** @return whether every command is logged */
+    public boolean isVerbose() {
+        return verbose;
+    }
+
     @Override
     public String toString() {
-        return String.format(
-                "ServerConfig{port=%d, bossThreads=%d, workerThreads=%d, " +
-                        "maxConnections=%d, cacheCapacity=%d, policy=%s, " +
-                        "sweepIntervalMs=%d, persistence=%b, snapshotPath='%s', verbose=%b}",
-                port, bossThreads, workerThreads,
-                maxConnections, cacheCapacity, evictionPolicy,
-                sweepIntervalMs, persistenceEnabled, snapshotPath, verbose
-        );
+        return String.format("ServerConfig{port=%d, bossThreads=%d, workerThreads=%d, maxConnections=%d, "
+                        + "rateLimit=%d, rateLimitBurst=%d, capacity=%d, policy=%s, segments=%d, defaultTtl=%ds, sweepIntervalMs=%d, "
+                        + "persistence=%b, snapshotPath='%s', snapshotIntervalMs=%d, verbose=%b}",
+                port, bossThreads, workerThreads, maxConnections, rateLimitPerSecond, rateLimitBurst,
+                cacheCapacity, evictionPolicy, segments,
+                defaultTtlSeconds, sweepIntervalMs, persistenceEnabled, snapshotPath, snapshotIntervalMs, verbose);
     }
 
-    // =========================================================================
-    // Builder
-    // =========================================================================
-
-    /**
-     * Builder for ServerConfig.
-     *
-     * All fields are pre-initialised to their defaults, so calling .build()
-     * immediately gives you a valid all-defaults config. Override only what
-     * you need to change.
-     *
-     * Every setter validates its input and throws IllegalArgumentException
-     * for obviously wrong values (negative port, zero threads, etc.).
-     * This catches misconfiguration at startup, not at runtime.
-     */
+    /** Builder for {@link ServerConfig}. Setters validate their argument. */
     public static final class Builder {
+        private int port = DEFAULT_PORT;
+        private int bossThreads = DEFAULT_BOSS_THREADS;
+        private int workerThreads = DEFAULT_WORKER_THREADS;
+        private int maxConnections = DEFAULT_MAX_CONNECTIONS;
+        private int rateLimitPerSecond = DEFAULT_RATE_LIMIT;
+        private int rateLimitBurst = DEFAULT_RATE_LIMIT_BURST;
+        private int cacheCapacity = DEFAULT_CACHE_CAPACITY;
+        private CachePolicyType evictionPolicy = DEFAULT_POLICY;
+        private int segments = DEFAULT_SEGMENTS;
+        private long defaultTtlSeconds = DEFAULT_TTL_SECONDS;
+        private long sweepIntervalMs = DEFAULT_SWEEP_INTERVAL_MS;
+        private boolean persistenceEnabled = DEFAULT_PERSISTENCE_ENABLED;
+        private String snapshotPath = DEFAULT_SNAPSHOT_PATH;
+        private long snapshotIntervalMs = DEFAULT_SNAPSHOT_INTERVAL_MS;
+        private boolean verbose = DEFAULT_VERBOSE;
 
-        // Pre-initialise all fields to defaults
-        private int             port               = DEFAULT_PORT;
-        private int             bossThreads        = DEFAULT_BOSS_THREADS;
-        private int             workerThreads      = DEFAULT_WORKER_THREADS;
-        private int             maxConnections     = DEFAULT_MAX_CONNECTIONS;
-        private int             cacheCapacity      = DEFAULT_CACHE_CAPACITY;
-        private CachePolicyType evictionPolicy     = DEFAULT_POLICY;
-        private long            sweepIntervalMs    = DEFAULT_SWEEP_INTERVAL_MS;
-        private boolean         persistenceEnabled = DEFAULT_PERSISTENCE_ENABLED;
-        private String          snapshotPath       = DEFAULT_SNAPSHOT_PATH;
-        private boolean         verbose            = DEFAULT_VERBOSE;
-
-        /** Package-private — use ServerConfig.builder() */
-        Builder() {}
+        Builder() {
+        }
 
         /**
-         * Sets the TCP port.
-         * @param port Port number, must be 1-65535.
-         * @return this Builder.
+         * @param port TCP port, 0 for any free port
+         * @return this builder
          */
         public Builder port(int port) {
-            // Port 0 is valid — tells the OS to assign any free ephemeral port.
-            // Used in tests to avoid port collisions between test classes.
-            // After bind, call CacheServer.getPort() for the actual assigned port.
             if (port < 0 || port > 65535) {
                 throw new IllegalArgumentException("Port must be 0-65535, got: " + port);
             }
@@ -377,70 +278,62 @@ public final class ServerConfig {
         }
 
         /**
-         * Sets the number of Netty boss threads.
-         * @param bossThreads Must be >= 1. Almost always 1.
-         * @return this Builder.
+         * @param bossThreads number of acceptor threads, at least 1
+         * @return this builder
          */
         public Builder bossThreads(int bossThreads) {
-            if (bossThreads < 1) {
-                throw new IllegalArgumentException("bossThreads must be >= 1");
-            }
-            this.bossThreads = bossThreads;
+            this.bossThreads = requirePositive(bossThreads, "bossThreads");
             return this;
         }
 
         /**
-         * Sets the number of Netty worker threads.
-         * @param workerThreads Must be >= 1.
-         * @return this Builder.
+         * @param workerThreads number of I/O threads, at least 1
+         * @return this builder
          */
         public Builder workerThreads(int workerThreads) {
-            if (workerThreads < 1) {
-                throw new IllegalArgumentException("workerThreads must be >= 1");
-            }
-            this.workerThreads = workerThreads;
+            this.workerThreads = requirePositive(workerThreads, "workerThreads");
             return this;
         }
 
         /**
-         * Sets the maximum number of concurrent client connections.
-         * @param maxConnections Must be >= 1.
-         * @return this Builder.
+         * @param maxConnections connection limit, at least 1
+         * @return this builder
          */
         public Builder maxConnections(int maxConnections) {
-            if (maxConnections < 1) {
-                throw new IllegalArgumentException("maxConnections must be >= 1");
-            }
-            this.maxConnections = maxConnections;
+            this.maxConnections = requirePositive(maxConnections, "maxConnections");
             return this;
         }
 
-        public PersistenceConfig toPersistenceConfig() {
-            return new PersistenceConfig(
-                    persistenceEnabled,
-                    snapshotPath,
-                    300_000L,
-                    100
-            );
+        /**
+         * @param perSecond commands per second per connection, 0 for no limit
+         * @return this builder
+         */
+        public Builder rateLimitPerSecond(int perSecond) {
+            this.rateLimitPerSecond = requireNonNegative(perSecond, "rateLimitPerSecond");
+            return this;
         }
 
         /**
-         * Sets the maximum cache capacity (number of entries).
-         * @param cacheCapacity Must be >= 1.
-         * @return this Builder.
+         * @param burst commands a connection may send at once, 0 for the same as the rate
+         * @return this builder
+         */
+        public Builder rateLimitBurst(int burst) {
+            this.rateLimitBurst = requireNonNegative(burst, "rateLimitBurst");
+            return this;
+        }
+
+        /**
+         * @param cacheCapacity maximum number of entries, at least 1
+         * @return this builder
          */
         public Builder cacheCapacity(int cacheCapacity) {
-            if (cacheCapacity < 1) {
-                throw new IllegalArgumentException("cacheCapacity must be >= 1");
-            }
-            this.cacheCapacity = cacheCapacity;
+            this.cacheCapacity = requirePositive(cacheCapacity, "cacheCapacity");
             return this;
         }
 
         /**
-         * Sets the eviction policy.
-         * @param evictionPolicy Must not be null.
-         * @return this Builder.
+         * @param evictionPolicy the eviction policy
+         * @return this builder
          */
         public Builder evictionPolicy(CachePolicyType evictionPolicy) {
             if (evictionPolicy == null) {
@@ -451,9 +344,40 @@ public final class ServerConfig {
         }
 
         /**
-         * Sets the TTL sweeper interval.
-         * @param sweepIntervalMs Must be > 0.
-         * @return this Builder.
+         * @param policyName LRU, LFU or ARC, in any case
+         * @return this builder
+         */
+        public Builder evictionPolicy(String policyName) {
+            return evictionPolicy(parsePolicy(policyName));
+        }
+
+        /**
+         * @param segments number of lock segments, a power of two
+         * @return this builder
+         */
+        public Builder segments(int segments) {
+            if (segments <= 0 || Integer.bitCount(segments) != 1) {
+                throw new IllegalArgumentException("segments must be a positive power of 2, got: " + segments);
+            }
+            this.segments = segments;
+            return this;
+        }
+
+        /**
+         * @param seconds TTL for writes that do not give one, 0 for none
+         * @return this builder
+         */
+        public Builder defaultTtlSeconds(long seconds) {
+            if (seconds < 0) {
+                throw new IllegalArgumentException("defaultTtlSeconds must be >= 0, got: " + seconds);
+            }
+            this.defaultTtlSeconds = seconds;
+            return this;
+        }
+
+        /**
+         * @param sweepIntervalMs interval of the TTL sweeper, positive
+         * @return this builder
          */
         public Builder sweepIntervalMs(long sweepIntervalMs) {
             if (sweepIntervalMs <= 0) {
@@ -464,9 +388,8 @@ public final class ServerConfig {
         }
 
         /**
-         * Enables or disables persistence (AOF + snapshots).
-         * @param enabled true to enable persistence.
-         * @return this Builder.
+         * @param enabled whether to persist the cache to disk
+         * @return this builder
          */
         public Builder persistenceEnabled(boolean enabled) {
             this.persistenceEnabled = enabled;
@@ -474,9 +397,8 @@ public final class ServerConfig {
         }
 
         /**
-         * Sets the snapshot file path.
-         * @param snapshotPath Must not be null or blank.
-         * @return this Builder.
+         * @param snapshotPath data directory for persistence
+         * @return this builder
          */
         public Builder snapshotPath(String snapshotPath) {
             if (snapshotPath == null || snapshotPath.isBlank()) {
@@ -487,9 +409,20 @@ public final class ServerConfig {
         }
 
         /**
-         * Enables or disables verbose logging.
-         * @param verbose true to enable per-command logging.
-         * @return this Builder.
+         * @param snapshotIntervalMs interval between snapshots, 0 to only snapshot on shutdown
+         * @return this builder
+         */
+        public Builder snapshotIntervalMs(long snapshotIntervalMs) {
+            if (snapshotIntervalMs < 0) {
+                throw new IllegalArgumentException("snapshotIntervalMs must be >= 0");
+            }
+            this.snapshotIntervalMs = snapshotIntervalMs;
+            return this;
+        }
+
+        /**
+         * @param verbose whether to log every command
+         * @return this builder
          */
         public Builder verbose(boolean verbose) {
             this.verbose = verbose;
@@ -497,49 +430,97 @@ public final class ServerConfig {
         }
 
         /**
-         * Builds and returns an immutable ServerConfig.
-         * All fields have been validated by individual setters.
+         * Overrides values with those present in a properties file.
          *
-         * @return Fully constructed ServerConfig.
+         * @param path path of the file
+         * @return this builder
          */
+        public Builder applyProperties(String path) {
+            Properties props = new Properties();
+            try (InputStream in = Files.newInputStream(Path.of(path))) {
+                props.load(in);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Could not read config file " + path, e);
+            }
+            return apply(props::getProperty, "server.port", "server.boss.threads", "server.worker.threads",
+                    "server.max.connections", "server.verbose", "cache.capacity", "cache.policy",
+                    "cache.segments", "cache.default.ttl", "cache.sweep.interval.ms", "persistence.enabled",
+                    "persistence.snapshot.path", "persistence.snapshot.interval.ms", "server.rate.limit",
+                    "server.rate.limit.burst");
+        }
+
+        /**
+         * Overrides values with the {@code JCACHE_*} variables present in {@code env}.
+         *
+         * @param env environment variables, usually {@link System#getenv()}
+         * @return this builder
+         */
+        public Builder applyEnvironment(Map<String, String> env) {
+            return apply(env::get, "JCACHE_PORT", "JCACHE_BOSS_THREADS", "JCACHE_THREADS",
+                    "JCACHE_MAX_CONNECTIONS", "JCACHE_VERBOSE", "JCACHE_CAPACITY", "JCACHE_POLICY",
+                    "JCACHE_SEGMENTS", "JCACHE_DEFAULT_TTL", "JCACHE_SWEEP_INTERVAL", "JCACHE_PERSISTENCE_ENABLED",
+                    "JCACHE_SNAPSHOT_PATH", "JCACHE_SNAPSHOT_INTERVAL_MS", "JCACHE_RATE_LIMIT",
+                    "JCACHE_RATE_LIMIT_BURST");
+        }
+
+        /** @return the configuration */
         public ServerConfig build() {
             return new ServerConfig(this);
         }
-    }
 
-    // =========================================================================
-    // Private static helpers for fromProperties()
-    // =========================================================================
-
-    private static int parseInt(Properties props, String key, int defaultValue) {
-        String value = props.getProperty(key);
-        if (value == null || value.isBlank()) return defaultValue;
-        try {
-            return Integer.parseInt(value.trim());
-        } catch (NumberFormatException e) {
-            System.err.printf(
-                    "[ServerConfig] Invalid int for '%s': '%s', using default %d%n",
-                    key, value, defaultValue);
-            return defaultValue;
+        /** Applies the settings in the fixed order of {@code names}; missing ones are skipped. */
+        private Builder apply(Function<String, String> source, String... names) {
+            set(source, names[0], v -> port(Integer.parseInt(v)));
+            set(source, names[1], v -> bossThreads(Integer.parseInt(v)));
+            set(source, names[2], v -> workerThreads(Integer.parseInt(v)));
+            set(source, names[3], v -> maxConnections(Integer.parseInt(v)));
+            set(source, names[4], v -> verbose(Boolean.parseBoolean(v)));
+            set(source, names[5], v -> cacheCapacity(Integer.parseInt(v)));
+            set(source, names[6], v -> evictionPolicy(parsePolicy(v)));
+            set(source, names[7], v -> segments(Integer.parseInt(v)));
+            set(source, names[8], v -> defaultTtlSeconds(Long.parseLong(v)));
+            set(source, names[9], v -> sweepIntervalMs(Long.parseLong(v)));
+            set(source, names[10], v -> persistenceEnabled(Boolean.parseBoolean(v)));
+            set(source, names[11], this::snapshotPath);
+            set(source, names[12], v -> snapshotIntervalMs(Long.parseLong(v)));
+            set(source, names[13], v -> rateLimitPerSecond(Integer.parseInt(v)));
+            set(source, names[14], v -> rateLimitBurst(Integer.parseInt(v)));
+            return this;
         }
-    }
 
-    private static long parseLong(Properties props, String key, long defaultValue) {
-        String value = props.getProperty(key);
-        if (value == null || value.isBlank()) return defaultValue;
-        try {
-            return Long.parseLong(value.trim());
-        } catch (NumberFormatException e) {
-            System.err.printf(
-                    "[ServerConfig] Invalid long for '%s': '%s', using default %d%n",
-                    key, value, defaultValue);
-            return defaultValue;
+        private static void set(Function<String, String> source, String name, Consumer<String> setter) {
+            String raw = source.apply(name);
+            if (raw == null || raw.isBlank()) {
+                return;
+            }
+            try {
+                setter.accept(raw.trim());
+            } catch (IllegalArgumentException e) {
+                // NumberFormatException is an IllegalArgumentException too.
+                throw new IllegalArgumentException("Invalid value for " + name + ": '" + raw + "'", e);
+            }
         }
-    }
 
-    private static boolean parseBoolean(Properties props, String key, boolean defaultValue) {
-        String value = props.getProperty(key);
-        if (value == null || value.isBlank()) return defaultValue;
-        return Boolean.parseBoolean(value.trim());
+        private static CachePolicyType parsePolicy(String value) {
+            try {
+                return CachePolicyType.valueOf(value.toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("unknown policy, expected LRU, LFU or ARC");
+            }
+        }
+
+        private static int requireNonNegative(int value, String name) {
+            if (value < 0) {
+                throw new IllegalArgumentException(name + " must be >= 0, got: " + value);
+            }
+            return value;
+        }
+
+        private static int requirePositive(int value, String name) {
+            if (value < 1) {
+                throw new IllegalArgumentException(name + " must be >= 1, got: " + value);
+            }
+            return value;
+        }
     }
 }

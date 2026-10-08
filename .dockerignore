@@ -1,0 +1,12 @@
+**/target/
+.git/
+.github/
+.idea/
+.junie/
+.mvn/
+**/*.iml
+**/.DS_Store
+docs/
+archived/
+distribution/scripts/
+jcache-data/

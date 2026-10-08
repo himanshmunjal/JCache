@@ -6,329 +6,242 @@ import com.cache.api.EvictionPolicy;
 import com.cache.core.DoublyLinkedList;
 import com.cache.core.Node;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
+
+import static com.cache.policy.LRUCache.requireKey;
+import static com.cache.policy.LRUCache.requireValue;
 
 /**
- * LFU (Least Frequently Used) cache implementation.
- * Algorithm:
- *  - HashMap gives O(1) key → node lookup.
- *  - Each frequency has its own DoublyLinkedList.
- *  - freqMap maps:
- *      frequency -> DLL of nodes with that frequency
- *  Example:
- *      freq=1 : A <-> B
- *      freq=2 : C
- *      freq=5 : D
- *  - On get:
- *      Increase node frequency.
- *      Move node from old frequency list to new frequency list.
- *  - On put:
- *      If key exists:
- *          update value + increase frequency.
- *      If new key:
- *          insert into frequency=1 list.
- *      If capacity exceeded:
- *          evict least frequently used node.
- *  - Eviction:
- *      Remove from minFreq list.
- *      If multiple nodes share same frequency,
- *      remove least recently used among them.
- * Time Complexity:
- *  - get()  -> O(1)
- *  - put()  -> O(1)
- *  - evict()-> O(1)
+ * Least-frequently-used cache with O(1) operations, following Shah, Mitra and
+ * Matani, "An O(1) algorithm for implementing the LFU cache eviction scheme"
+ * (2010).
  *
- * @param <K> Key type
- * @param <V> Value type
+ * <p>Entries are grouped into one list per access count, and the lowest
+ * non-empty count is tracked in {@code minFreq}. Eviction removes the least
+ * recently used entry from that bucket, so ties are broken by recency.
+ *
+ * <p>Plain LFU never forgets: a key that was hot an hour ago keeps a high
+ * count and cannot be evicted after it goes cold. To avoid that, every
+ * {@value #DECAY_INTERVAL_OPS} operations all counts are halved. The decay pass
+ * is O(n) but amortises to O(1) per operation.
+ *
+ * <p>Not thread-safe.
+ *
+ * @param <K> key type
+ * @param <V> value type
  */
 public class LFUCache<K, V> implements Cache<K, V>, EvictionPolicy<K> {
 
+    static final int DECAY_INTERVAL_OPS = 10_000;
+
     private final int capacity;
-    //Main lookup table key -> node
     private final Map<K, Node<K, V>> map;
-    // Frequency table:frequency -> DLL of nodes
-    private final Map<Integer, DoublyLinkedList<K, V>> freqMap;
+    private final Map<Integer, DoublyLinkedList<K, V>> buckets = new HashMap<>();
+    private int minFreq;
+    private int opsSinceDecay;
+
+    private long hits;
+    private long misses;
+    private long evictions;
 
     /**
-     * Tracks the minimum frequency currently present in cache.
-     * Example:
-     *  freq=1 : A B
-     *  freq=2 : C
-     * minFreq = 1
+     * Creates an empty cache.
+     *
+     * @param capacity maximum number of entries, must be positive
      */
-    private int minFreq = 1;
-
-    // Stats
-    private final AtomicLong hits = new AtomicLong(0);
-    private final AtomicLong misses = new AtomicLong(0);
-    private final AtomicLong evictions = new AtomicLong(0);
-
-    // Constructor
     public LFUCache(int capacity) {
         if (capacity <= 0) {
-            throw new IllegalArgumentException(
-                    "Capacity must be > 0, got: " + capacity
-            );
+            throw new IllegalArgumentException("Capacity must be > 0, got: " + capacity);
         }
-
         this.capacity = capacity;
         this.map = new HashMap<>(capacity);
-        this.freqMap = new HashMap<>();
     }
 
-    @Override
-    public void clear() {
-        map.clear();
-        freqMap.clear();
-        minFreq = 0;
-    }
-
-    // Cache Interface
-    /**
-     * Returns value for key.
-     * On successful access:
-     *  - increase frequency
-     *  - move node to new frequency list
-     * O(1).
-     */
     @Override
     public V get(K key) {
-        Node<K, V> node = map.get(key);
+        requireKey(key);
+        tickDecayClock();
 
-        // Cache miss
+        Node<K, V> node = map.get(key);
         if (node == null) {
-            misses.incrementAndGet();
+            misses++;
             return null;
         }
-
-        // Lazy TTL eviction
         if (node.isExpired()) {
             evict(key);
-            misses.incrementAndGet();
+            misses++;
             return null;
         }
-
-        hits.incrementAndGet();
-
-        // Increase frequency
-        updateFrequency(node);
-
+        hits++;
+        incrementFrequency(node);
         return node.value;
     }
 
-    /**
-     * Inserts key-value pair with no TTL.
-     */
     @Override
     public void put(K key, V value) {
-        put(key, value, -1);
+        put(key, value, Node.NO_EXPIRY);
     }
 
     /**
-     * Inserts key-value pair with optional TTL.
-     * O(1).
+     * Stores a value that expires after {@code ttlMillis}.
+     *
+     * @param key       the key
+     * @param value     the value
+     * @param ttlMillis time to live in milliseconds, or {@link Node#NO_EXPIRY}
      */
     public void put(K key, V value, long ttlMillis) {
+        requireKey(key);
+        requireValue(value);
+        tickDecayClock();
 
-        // Capacity edge case
-        if (capacity == 0) return;
-
-        // Update existing node
-        if (map.containsKey(key)) {
-
-            Node<K, V> node = map.get(key);
-            node.value = value;
-            node.expiryTime =
-                    (ttlMillis == -1)
-                            ? -1
-                            : System.currentTimeMillis() + ttlMillis;
-            updateFrequency(node);
+        Node<K, V> existing = map.get(key);
+        if (existing != null) {
+            existing.value = value;
+            existing.expireAfter(ttlMillis);
+            incrementFrequency(existing);
             return;
         }
 
-        // Evict if full─
         if (map.size() >= capacity) {
-            evictLFU();
+            evict();
         }
-
-        // Create new node
-        Node<K, V> newNode =
-                (ttlMillis == -1)
-                        ? new Node<>(key, value)
-                        : new Node<>(key, value, ttlMillis);
-
-        // New nodes always start at frequency=1
-        newNode.frequency = 1;
-
-        // Reset min frequency
+        Node<K, V> node = new Node<>(key, value);
+        node.expireAfter(ttlMillis);
+        node.frequency = 1;
+        bucket(1).addToFront(node);
+        map.put(key, node);
         minFreq = 1;
-
-        // Create freq=1 list if absent
-        freqMap.putIfAbsent(1, new DoublyLinkedList<>());
-
-        // Add node to freq=1 list
-        freqMap.get(1).addToFront(newNode);
-
-        // Add to main map
-        map.put(key, newNode);
     }
 
-    /**
-     * Removes a key explicitly from cache.
-     * O(1).
-     */
     @Override
     public void evict(K key) {
-
         Node<K, V> node = map.remove(key);
-
-        if (node == null) return;
-
-        DoublyLinkedList<K, V> list =
-                freqMap.get(node.frequency);
-
-        list.remove(node);
-
-        evictions.incrementAndGet();
-
-        // Cleanup empty frequency list
-        if (list.isEmpty() && node.frequency == minFreq) {
-            minFreq++;
+        if (node != null) {
+            unlink(node);
         }
     }
 
-    /**
-     * Returns current cache size.
-     */
+    @Override
+    public V peek(K key) {
+        Node<K, V> node = map.get(key);
+        return node == null || node.isExpired() ? null : node.value;
+    }
+
     @Override
     public int size() {
         return map.size();
     }
 
-    /**
-     * Returns cache statistics.
-     */
     @Override
-    public CacheStats getstats() {
-
-        long h = hits.get();
-        long m = misses.get();
-
-        long total = h + m;
-
-        double hitRate =
-                (total == 0)
-                        ? 0.0
-                        : (double) h / total;
-
-        return new CacheStats(
-                h,
-                m,
-                evictions.get(),
-                hitRate
-        );
+    public CacheStats getStats() {
+        return CacheStats.of(hits, misses, evictions);
     }
 
-    // EvictionPolicy Interface
+    @Override
+    public void clear() {
+        map.clear();
+        buckets.clear();
+        minFreq = 0;
+    }
 
-    /**
-     * Called on access.
-     *
-     * In LFU:
-     *  access = increase frequency.
-     */
     @Override
     public void onAccess(K key) {
-
         Node<K, V> node = map.get(key);
-
         if (node != null) {
-            updateFrequency(node);
+            incrementFrequency(node);
         }
     }
 
     @Override
     public void onInsert(K key) {
-        // Already handled in put()
+        // put() already places new nodes in the frequency-1 bucket.
     }
 
-    /**
-     * Evicts LFU node and returns its key.
-     */
     @Override
     public K evict() {
-        DoublyLinkedList<K, V> minList =
-                freqMap.get(minFreq);
-        if (minList == null) return null;
-        Node<K, V> lfu = minList.removeLast();
-        if (lfu == null) return null;
-        map.remove(lfu.key);
-        evictions.incrementAndGet();
-        return lfu.key;
-    }
-
-    // Internal Frequency Logic
-    /**
-     * Core LFU operation.
-     * Moves node:
-     *      freq=N   -> freq=N+1
-     * Steps:
-     *  1. Remove from old frequency list
-     *  2. Increase frequency
-     *  3. Add to new frequency list
-     * O(1).
-     */
-    private void updateFrequency(Node<K, V> node) {
-        int oldFreq = node.frequency;
-
-        // Get old frequency list
-        DoublyLinkedList<K, V> oldList =
-                freqMap.get(oldFreq);
-
-        // Remove node from old list
-        oldList.remove(node);
-
-        // If old min frequency becomes empty, increase min frequency
-        if (oldFreq == minFreq && oldList.isEmpty()) {
-            minFreq++;
+        if (map.isEmpty()) {
+            return null;
         }
-
-        // Increase node frequency
-        node.frequency++;
-
-        // Create new frequency list if needed
-        freqMap.putIfAbsent(
-                node.frequency,
-                new DoublyLinkedList<>()
-        );
-
-        // Add node to front of new frequency list
-        freqMap
-                .get(node.frequency)
-                .addToFront(node);
+        DoublyLinkedList<K, V> lowest = buckets.get(minFreq);
+        if (lowest == null) {
+            // minFreq can go stale after an explicit evict(key); the number of
+            // distinct frequencies is small, so finding the new minimum is cheap.
+            minFreq = Collections.min(buckets.keySet());
+            lowest = buckets.get(minFreq);
+        }
+        Node<K, V> victim = lowest.peekLast();
+        map.remove(victim.key);
+        unlink(victim);
+        evictions++;
+        return victim.key;
     }
 
     /**
-     * Removes least frequently used node.
-     * If multiple nodes have same frequency,
-     * remove least recently used among them.
-     * O(1).
+     * Returns the access count currently recorded for {@code key}.
+     *
+     * @param key the key
+     * @return the frequency, or 0 if the key is absent
      */
-    private void evictLFU() {
-        DoublyLinkedList<K, V> minList = freqMap.get(minFreq);
-
-        Node<K, V> node = minList.removeLast();
-
-        if (node != null) {
-            map.remove(node.key);
-            evictions.incrementAndGet();
-        }
+    public int frequencyOf(K key) {
+        Node<K, V> node = map.get(key);
+        return node == null ? 0 : node.frequency;
     }
 
     @Override
     public String toString() {
-        return "LFUCache(capacity=" + capacity + ", size=" + size() + ") "+ freqMap;
+        return "LFUCache(capacity=" + capacity + ", size=" + size() + ") " + buckets;
+    }
+
+    private void incrementFrequency(Node<K, V> node) {
+        int oldFreq = node.frequency;
+        unlink(node);
+        if (oldFreq == minFreq && !buckets.containsKey(oldFreq)) {
+            minFreq = oldFreq + 1;
+        }
+        node.frequency = oldFreq + 1;
+        bucket(node.frequency).addToFront(node);
+    }
+
+    /** Removes the node from its frequency bucket and drops the bucket if it empties. */
+    private void unlink(Node<K, V> node) {
+        DoublyLinkedList<K, V> list = buckets.get(node.frequency);
+        list.remove(node);
+        if (list.isEmpty()) {
+            buckets.remove(node.frequency);
+        }
+    }
+
+    private DoublyLinkedList<K, V> bucket(int frequency) {
+        return buckets.computeIfAbsent(frequency, f -> new DoublyLinkedList<>());
+    }
+
+    private void tickDecayClock() {
+        if (++opsSinceDecay >= DECAY_INTERVAL_OPS) {
+            opsSinceDecay = 0;
+            decayFrequencies();
+        }
+    }
+
+    /**
+     * Halves every count (keeping a floor of 1) and rebuilds the buckets.
+     * Ordering inside a bucket is not preserved, which only affects how ties
+     * are broken right after a decay.
+     */
+    private void decayFrequencies() {
+        if (map.isEmpty()) {
+            return;
+        }
+        buckets.clear();
+        int newMin = Integer.MAX_VALUE;
+        for (Node<K, V> node : map.values()) {
+            node.frequency = Math.max(1, node.frequency / 2);
+            node.prev = null;
+            node.next = null;
+            bucket(node.frequency).addToFront(node);
+            newMin = Math.min(newMin, node.frequency);
+        }
+        minFreq = newMin;
     }
 }

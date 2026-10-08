@@ -1,148 +1,148 @@
 package com.cache.core;
 
 /**
- * Intrusive doubly linked list used internally by cache eviction policies.
+ * Intrusive doubly linked list with sentinel head and tail nodes, so that
+ * insertions and removals never need null checks. The front of the list is
+ * the most recently used end.
  *
- * Design decisions:
- *  - Uses sentinel head and tail nodes so that every real node always has
- *    non-null prev and next. This eliminates all null checks in add/remove.
- *  - Package-private — this is an internal data structure, not part of the
- *    public API. Cache implementations in the policy package use it directly.
- *  - Not thread-safe on its own. The cache layer above is responsible for
- *    synchronization. Keeping locking out of this class lets us swap locking
- *    strategies (coarse, segmented, lock-free) without touching the list.
+ * <p>Not thread-safe. Callers are expected to guard it with whatever lock
+ * protects the surrounding cache.
  *
- * Layout (most-recent → least-recent):
- *   head <-> [newest node] <-> ... <-> [oldest node] <-> tail
- *
- * @param <K> Key type
- * @param <V> Value type
+ * @param <K> key type
+ * @param <V> value type
  */
 public class DoublyLinkedList<K, V> {
 
-    // Sentinel nodes — never hold real data, never removed
-    private final Node<K, V> head;
-    private final Node<K, V> tail;
-
+    private final Node<K, V> head = new Node<>(null, null);
+    private final Node<K, V> tail = new Node<>(null, null);
     private int size;
 
+    /** Creates an empty list. */
     public DoublyLinkedList() {
-        head = new Node<>(null, null);
-        tail = new Node<>(null, null);
         head.next = tail;
         tail.prev = head;
-        size = 0;
     }
 
-    // ── Core operations ───────────────────────────────────────────────────────
-
     /**
-     * Inserts node immediately after head (most-recently-used position).
-     * O(1).
+     * Inserts {@code node} at the front. The node must not currently be linked.
+     *
+     * @param node the node to insert
      */
     public void addToFront(Node<K, V> node) {
-        node.prev      = head;
-        node.next      = head.next;
+        node.prev = head;
+        node.next = head.next;
         head.next.prev = node;
-        head.next      = node;
+        head.next = node;
         size++;
     }
 
     /**
-     * Unlinks node from wherever it currently sits in the list.
-     * Caller is responsible for ensuring the node is actually in this list.
-     * O(1) — no traversal needed because nodes carry their own prev/next.
+     * Unlinks {@code node}. The caller must make sure the node belongs to this
+     * list; removing a node that is already unlinked is a no-op.
+     *
+     * @param node the node to remove
      */
-    public void remove(Node<K,V> node) {
-        if (node == null) return;
-
-        Node<K,V> prev = node.prev;
-        Node<K,V> next = node.next;
-
-        if (prev != null) {
-            prev.next = next;
+    public void remove(Node<K, V> node) {
+        if (node == null || (node.prev == null && node.next == null)) {
+            return;
         }
-
-        if (next != null) {
-            next.prev = prev;
-        }
-
+        node.prev.next = node.next;
+        node.next.prev = node.prev;
         node.prev = null;
         node.next = null;
+        size--;
     }
 
     /**
-     * Removes and returns the node just before the tail (least-recently-used).
-     * Returns null if the list is empty.
-     * O(1).
-     */
-    public Node<K, V> removeLast() {
-        if (isEmpty()) return null;
-        Node<K, V> last = tail.prev;
-        remove(last);
-        return last;
-    }
-
-    /**
-     * Returns the node just before the tail without removing it.
-     * Returns null if the list is empty.
-     */
-    public Node<K, V> peekLast() {
-        if (isEmpty()) return null;
-        return tail.prev;
-    }
-
-    /**
-     * Returns the node just after the head (most-recently-used) without removing it.
-     * Returns null if the list is empty.
-     */
-    public Node<K, V> peekFirst() {
-        if (isEmpty()) return null;
-        return head.next;
-    }
-
-    // ── Convenience ───────────────────────────────────────────────────────────
-
-    /**
-     * Moves an already-linked node to the front in O(1).
-     * Used by LRU on every cache hit.
+     * Moves an already linked node to the front.
+     *
+     * @param node the node to move
      */
     public void moveToFront(Node<K, V> node) {
         remove(node);
         addToFront(node);
     }
 
-
-    public void clear() {
-        head.next = tail;
-        tail.prev = head;
+    /**
+     * Removes and returns the last (least recently used) node.
+     *
+     * @return the removed node, or {@code null} if the list is empty
+     */
+    public Node<K, V> removeLast() {
+        if (isEmpty()) {
+            return null;
+        }
+        Node<K, V> last = tail.prev;
+        remove(last);
+        return last;
     }
 
-    public Node<K,V> removeFirst(){
-        if(isEmpty())return null;
-        Node<K,V> first = head.next;
+    /**
+     * Removes and returns the first (most recently used) node.
+     *
+     * @return the removed node, or {@code null} if the list is empty
+     */
+    public Node<K, V> removeFirst() {
+        if (isEmpty()) {
+            return null;
+        }
+        Node<K, V> first = head.next;
         remove(first);
         return first;
     }
 
+    /**
+     * Returns the last node without removing it.
+     *
+     * @return the last node, or {@code null} if the list is empty
+     */
+    public Node<K, V> peekLast() {
+        return isEmpty() ? null : tail.prev;
+    }
+
+    /**
+     * Returns the first node without removing it.
+     *
+     * @return the first node, or {@code null} if the list is empty
+     */
+    public Node<K, V> peekFirst() {
+        return isEmpty() ? null : head.next;
+    }
+
+    /** Drops every node. Nodes that were linked are left with stale pointers. */
+    public void clear() {
+        head.next = tail;
+        tail.prev = head;
+        size = 0;
+    }
+
+    /**
+     * Returns whether the list has no nodes.
+     *
+     * @return {@code true} if empty
+     */
     public boolean isEmpty() {
         return size == 0;
     }
 
+    /**
+     * Returns the number of linked nodes.
+     *
+     * @return the node count
+     */
     public int size() {
         return size;
     }
 
     @Override
     public String toString() {
-        StringBuilder sb = new StringBuilder("DLL[");
-        Node<K, V> curr = head.next;
-        while (curr != tail) {
-            sb.append(curr.key);
-            if (curr.next != tail) sb.append(" <-> ");
-            curr = curr.next;
+        StringBuilder sb = new StringBuilder("[");
+        for (Node<K, V> n = head.next; n != tail; n = n.next) {
+            sb.append(n.key);
+            if (n.next != tail) {
+                sb.append(" <-> ");
+            }
         }
-        sb.append("]");
-        return sb.toString();
+        return sb.append(']').toString();
     }
 }

@@ -1,331 +1,174 @@
 package com.cache.common.protocol;
 
-/**
- * Command defines the set of operations the cache server understands,
- * and ParsedCommand is the structured result of parsing a raw client string.
- *
- * TWO THINGS IN ONE FILE — WHY?
- * Command (enum) and ParsedCommand (inner class) are tightly coupled:
- * a ParsedCommand always contains a Command type. Keeping them in one file
- * avoids a proliferation of tiny files and makes the relationship explicit.
- * This is a common pattern in protocol implementations (e.g., HTTP method + request).
- *
- * COMMAND ENUM:
- * Each enum constant represents one verb the client can send.
- * The enum stores the expected argument count range (min/max) so
- * CommandParser can validate argument counts without per-command switch statements.
- *
- * Example valid commands (full spec in docs/WireProtocol.md):
- *   PING                  → minArgs=0, maxArgs=0
- *   GET key               → minArgs=1, maxArgs=1
- *   PUT key value         → minArgs=2, maxArgs=3  (TTL is optional 3rd arg)
- *   DELETE key            → minArgs=1, maxArgs=1
- *   STATS                 → minArgs=0, maxArgs=0
- *   FLUSH                 → minArgs=0, maxArgs=0
- *
- * PARSEDCOMMAND INNER CLASS:
- * Carries the parsed result: which command + what arguments.
- * Immutable — set once by CommandParser, never modified by CacheServerHandler.
- *
- * NAMING — why "ParsedCommand" not "Request"?
- * "Request" implies HTTP semantics. "ParsedCommand" is explicit:
- * this object IS a command THAT HAS BEEN parsed. The name describes
- * both what it is and how it was created.
- */
-public class Command {
+import java.util.Locale;
+import java.util.Map;
 
-    // =========================================================================
-    // Command enum
-    // =========================================================================
+/** Commands of the JCache text protocol and their parsed form. */
+public final class Command {
 
-    /**
-     * The set of commands the cache server recognizes.
-     *
-     * Each constant stores:
-     *   minArgs — minimum number of arguments required after the verb
-     *   maxArgs — maximum number of arguments accepted after the verb
-     *
-     * CommandParser uses these to validate argument counts without
-     * needing a separate validation method per command.
-     *
-     * DESIGN NOTE — FLUSH requires confirmation in many real systems.
-     * We keep it simple here (no confirmation required) since this is
-     * a developer tool, not a production Redis deployment.
-     */
+    private Command() {
+    }
+
+    /** Command verbs, with the number of arguments each one accepts. */
     public enum Type {
-
-        /**
-         * PING — health check. Server responds with PONG.
-         * Syntax: PING
-         * Use case: connection health checks, latency measurement.
-         */
+        /** {@code PING}: liveness check. */
         PING(0, 0),
-
-        /**
-         * GET — retrieve a value by key.
-         * Syntax: GET key
-         * Response: +value  or  -ERR key not found
-         */
+        /** {@code GET key}. */
         GET(1, 1),
-
-        /**
-         * PUT — store a key-value pair, optionally with TTL.
-         * Syntax: PUT key value [ttlSeconds]
-         * Response: +OK
-         *
-         * minArgs=2 (key + value required)
-         * maxArgs=3 (optional TTL as third argument)
-         * TTL of 0 or omitted = no expiry.
-         */
-        PUT(2, 3),
-
-        /**
-         * DELETE — remove a key from the cache.
-         * Syntax: DELETE key
-         * Response: +OK (even if key didn't exist — idempotent)
-         *
-         * WHY IDEMPOTENT?
-         * Clients retry on network failures. If DELETE succeeds but
-         * the response is lost, the client retries. An idempotent DELETE
-         * is safe to retry — the key is gone either way.
-         */
+        /** {@code PUT key value [ttlSeconds]}; the value may contain spaces. */
+        PUT(2, Integer.MAX_VALUE),
+        /** {@code DELETE key}. */
         DELETE(1, 1),
-
-        /**
-         * STATS — return cache statistics.
-         * Syntax: STATS
-         * Response: +hits:N misses:N evictions:N size:N hitRate:N.NN
-         *
-         * Numbers come from CacheMetricsCollector in cache-core.
-         */
+        /** {@code EXPIRE key seconds}: set a new TTL on an existing key. */
+        EXPIRE(2, 2),
+        /** {@code TTL key}: remaining TTL in seconds. {@code TTL key seconds} is accepted as EXPIRE. */
+        TTL(1, 2),
+        /** {@code PERSIST key}: remove a key's TTL. */
+        PERSIST(1, 1),
+        /** {@code STATS}: server metrics. */
         STATS(0, 0),
+        /** {@code FLUSH}: remove every key. */
+        FLUSH(0, 0),
+        /** {@code QUIT}: close the connection. */
+        QUIT(0, 0);
 
-        /**
-         * FLUSH — remove ALL entries from the cache.
-         * Syntax: FLUSH
-         * Response: +OK
-         *
-         * Warning: destructive operation. No confirmation required.
-         * Only included for dev/test convenience.
-         */
-        FLUSH(0, 0);
+        private static final Map<String, Type> ALIASES = Map.of(
+                "SET", PUT,
+                "DEL", DELETE,
+                "EXIT", QUIT);
 
-        // ------------------------------------------------------------------
-        // Fields
-        // ------------------------------------------------------------------
-
-        /** Minimum number of arguments this command requires (not counting the verb). */
         private final int minArgs;
-
-        /** Maximum number of arguments this command accepts (not counting the verb). */
         private final int maxArgs;
-
-        // ------------------------------------------------------------------
-        // Constructor
-        // ------------------------------------------------------------------
 
         Type(int minArgs, int maxArgs) {
             this.minArgs = minArgs;
             this.maxArgs = maxArgs;
         }
 
-        // ------------------------------------------------------------------
-        // Getters
-        // ------------------------------------------------------------------
+        /** @return the minimum number of arguments */
+        public int getMinArgs() {
+            return minArgs;
+        }
 
-        /** @return Minimum argument count for this command. */
-        public int getMinArgs() { return minArgs; }
-
-        /** @return Maximum argument count for this command. */
-        public int getMaxArgs() { return maxArgs; }
+        /** @return the maximum number of arguments */
+        public int getMaxArgs() {
+            return maxArgs;
+        }
 
         /**
-         * Returns a human-readable argument count description for error messages.
-         * Examples:
-         *   GET  → "exactly 1 argument(s)"
-         *   PUT  → "2 to 3 argument(s)"
-         *   PING → "no arguments"
+         * Looks up a verb or one of its aliases, ignoring case.
          *
-         * @return A descriptive string for error messages.
+         * @param verb the verb as typed by the client
+         * @return the command type, or {@code null} if the verb is unknown
          */
-        public String argCountDescription() {
-            if (minArgs == 0 && maxArgs == 0) return "no arguments";
-            if (minArgs == maxArgs)            return "exactly " + minArgs + " argument(s)";
-            return minArgs + " to " + maxArgs + " argument(s)";
+        public static Type fromVerb(String verb) {
+            String upper = verb.toUpperCase(Locale.ROOT);
+            Type alias = ALIASES.get(upper);
+            if (alias != null) {
+                return alias;
+            }
+            for (Type t : values()) {
+                if (t.name().equals(upper)) {
+                    return t;
+                }
+            }
+            return null;
+        }
+
+        String describeArity() {
+            if (maxArgs == 0) {
+                return "no arguments";
+            }
+            if (minArgs == maxArgs) {
+                return minArgs == 1 ? "1 argument" : minArgs + " arguments";
+            }
+            if (maxArgs == Integer.MAX_VALUE) {
+                return "at least " + minArgs + " arguments";
+            }
+            return minArgs + " to " + maxArgs + " arguments";
         }
     }
 
-    // =========================================================================
-    // ParsedCommand inner class
-    // =========================================================================
-
-    /**
-     * ParsedCommand is the structured result of parsing a raw client command string.
-     *
-     * Produced by: CommandParser.parse(String rawLine)
-     * Consumed by: CacheServerHandler.channelRead0()
-     *
-     * IMMUTABILITY:
-     * All fields are final. ParsedCommand is created once by the parser
-     * and read once by the handler. No synchronization needed.
-     *
-     * NULL HANDLING:
-     * key and value are null for commands that don't use them (PING, STATS, FLUSH).
-     * ttlSeconds is 0 for commands without TTL or when TTL is not specified.
-     * CacheServerHandler must check type before accessing key/value.
-     */
+    /** A validated command, ready to execute. */
     public static final class ParsedCommand {
-
-        /** Which command this is. Never null. */
         private final Type type;
-
-        /**
-         * The cache key for GET, PUT, DELETE commands.
-         * Null for PING, STATS, FLUSH.
-         */
         private final String key;
-
-        /**
-         * The value to store for PUT commands.
-         * Null for GET, DELETE, PING, STATS, FLUSH.
-         */
         private final String value;
-
-        /**
-         * Time-to-live in seconds for PUT commands.
-         * 0 means no expiry.
-         * Always 0 for non-PUT commands.
-         */
         private final long ttlSeconds;
 
-        // ------------------------------------------------------------------
-        // Constructors — one per command shape
-        // ------------------------------------------------------------------
-
         /**
-         * Constructor for commands with no arguments: PING, STATS, FLUSH.
+         * Creates a command with no arguments.
          *
-         * @param type Command type.
+         * @param type the command
          */
         public ParsedCommand(Type type) {
             this(type, null, null, 0L);
         }
 
         /**
-         * Constructor for single-key commands: GET, DELETE.
+         * Creates a command that takes only a key.
          *
-         * @param type Command type.
-         * @param key  The cache key.
+         * @param type the command
+         * @param key  the key
          */
         public ParsedCommand(Type type, String key) {
             this(type, key, null, 0L);
         }
 
         /**
-         * Constructor for PUT without TTL.
+         * Creates a command.
          *
-         * @param type  Command type (PUT).
-         * @param key   The cache key.
-         * @param value The value to store.
-         */
-        public ParsedCommand(Type type, String key, String value) {
-            this(type, key, value, 0L);
-        }
-
-        /**
-         * Full constructor for PUT with TTL.
-         *
-         * @param type       Command type (PUT).
-         * @param key        The cache key.
-         * @param value      The value to store.
-         * @param ttlSeconds Time-to-live in seconds. 0 means no expiry.
+         * @param type       the command
+         * @param key        the key, or {@code null}
+         * @param value      the value, or {@code null}
+         * @param ttlSeconds TTL in seconds, 0 for none
          */
         public ParsedCommand(Type type, String key, String value, long ttlSeconds) {
-            this.type       = type;
-            this.key        = key;
-            this.value      = value;
+            this.type = type;
+            this.key = key;
+            this.value = value;
             this.ttlSeconds = ttlSeconds;
         }
 
-        // ------------------------------------------------------------------
-        // Getters
-        // ------------------------------------------------------------------
+        /** @return the command */
+        public Type getType() {
+            return type;
+        }
 
-        /** @return The command type. Never null. */
-        public Type getType() { return type; }
+        /** @return the key, or {@code null} */
+        public String getKey() {
+            return key;
+        }
 
-        /**
-         * Returns the cache key.
-         *
-         * @return Key string, or null for keyless commands (PING, STATS, FLUSH).
-         */
-        public String getKey() { return key; }
+        /** @return the value, or {@code null} */
+        public String getValue() {
+            return value;
+        }
 
-        /**
-         * Returns the value for PUT commands.
-         *
-         * @return Value string, or null for non-PUT commands.
-         */
-        public String getValue() { return value; }
+        /** @return the TTL in seconds, 0 if none was given */
+        public long getTtlSeconds() {
+            return ttlSeconds;
+        }
 
-        /**
-         * Returns the TTL in seconds for PUT commands.
-         * 0 means no expiry — key lives until evicted by policy.
-         *
-         * @return TTL in seconds, or 0 if not applicable.
-         */
-        public long getTtlSeconds() { return ttlSeconds; }
-
-        // ------------------------------------------------------------------
-        // Convenience predicates
-        // ------------------------------------------------------------------
-
-        /**
-         * Returns true if this command has a TTL set (PUT with explicit TTL).
-         *
-         * @return true if ttlSeconds > 0.
-         */
+        /** @return whether a positive TTL was given */
         public boolean hasTTL() {
             return ttlSeconds > 0;
         }
 
-        // ------------------------------------------------------------------
-        // toString — for logging and debugging
-        // ------------------------------------------------------------------
-
-        /**
-         * Returns a log-safe string representation.
-         * VALUE IS TRUNCATED to 32 chars to prevent log bloat from large values.
-         * Key is shown in full (keys should always be short).
-         *
-         * @return String representation for logging.
-         */
         @Override
         public String toString() {
             StringBuilder sb = new StringBuilder("ParsedCommand{type=").append(type);
-            if (key   != null) sb.append(", key='").append(key).append("'");
-            if (value != null) {
-                // Truncate long values in logs
-                String displayValue = value.length() > 32
-                        ? value.substring(0, 32) + "..."
-                        : value;
-                sb.append(", value='").append(displayValue).append("'");
+            if (key != null) {
+                sb.append(", key='").append(key).append('\'');
             }
-            if (ttlSeconds > 0) sb.append(", ttl=").append(ttlSeconds).append("s");
-            sb.append("}");
-            return sb.toString();
+            if (value != null) {
+                String shown = value.length() > 32 ? value.substring(0, 32) + "..." : value;
+                sb.append(", value='").append(shown).append('\'');
+            }
+            if (ttlSeconds > 0) {
+                sb.append(", ttl=").append(ttlSeconds).append('s');
+            }
+            return sb.append('}').toString();
         }
-    }
-
-    // =========================================================================
-    // Private constructor — this class is a namespace, not instantiated
-    // =========================================================================
-
-    /**
-     * This class is a namespace container for Command.Type and ParsedCommand.
-     * It should never be instantiated directly.
-     */
-    private Command() {
-        throw new UnsupportedOperationException("Command is a namespace class");
     }
 }

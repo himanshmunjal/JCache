@@ -8,60 +8,40 @@
     <parent>
         <groupId>com.cache</groupId>
         <artifactId>JCache</artifactId>
-        <version>1.0.0</version>
-        <relativePath>../pom.xml</relativePath>
+        <version>1.0.3</version>
     </parent>
 
     <artifactId>cache-integration-tests</artifactId>
+    <name>cache-integration-tests</name>
+    <description>End-to-end tests that run the real server and talk to it through the client
+        and through a Redis client library.</description>
+
+    <properties>
+        <maven.javadoc.skip>true</maven.javadoc.skip>
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
 
     <dependencies>
         <dependency>
             <groupId>com.cache</groupId>
-            <artifactId>cache-server</artifactId>  <!-- boots the real server -->
-            <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.cache</groupId>
-            <artifactId>cache-client</artifactId>  <!-- connects to it -->
-            <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.cache</groupId>
-            <artifactId>cache-common</artifactId>  <!-- shared types -->
-            <version>${project.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <version>5.10.2</version>
+            <artifactId>cache-server</artifactId>
             <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-            <version>2.0.12</version>
-        </dependency>
-        <dependency>
-            <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-classic</artifactId>
-            <version>1.5.3</version>
         </dependency>
         <dependency>
             <groupId>com.cache</groupId>
             <artifactId>cache-client</artifactId>
-            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.2.5</version>
-            </plugin>
-        </plugins>
-    </build>
 
 </project>

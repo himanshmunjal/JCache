@@ -269,9 +269,7 @@ Spins up three JCache nodes on ports 6379, 6380, 6381. `ClusterCacheClient` conn
 ### Startup Banner
 
 ```
-==========================================
   JCache Server started successfully
-==========================================
   Port      : 6379
   Policy    : ARC
   Capacity  : 50,000
@@ -279,10 +277,8 @@ Spins up three JCache nodes on ports 6379, 6380, 6381. `ClusterCacheClient` conn
   Max Conn  : 1,000
   Verbose   : false
   Persist   : true
-==========================================
   Ready to accept connections
   Use Ctrl+C or SIGTERM to stop
-==========================================
 ```
 
 ---
