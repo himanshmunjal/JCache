@@ -19,7 +19,10 @@ jobs:
           cache: maven
 
       - name: Build and test
-        run: mvn -B --no-transfer-progress verify
+        run: mvn -B --no-transfer-progress install
+
+      - name: Starter project
+        run: mvn -B --no-transfer-progress -f starter/pom.xml verify
 
       - name: Javadoc
         run: mvn -B --no-transfer-progress -DskipTests javadoc:aggregate

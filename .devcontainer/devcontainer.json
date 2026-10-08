@@ -1,0 +1,17 @@
+{
+  "name": "JCache",
+  "image": "mcr.microsoft.com/devcontainers/java:1-21",
+  "features": {
+    "ghcr.io/devcontainers/features/java:1": {
+      "installMaven": "true",
+      "version": "none"
+    }
+  },
+  "forwardPorts": [6379],
+  "postCreateCommand": "mvn -B -q -DskipTests install",
+  "customizations": {
+    "vscode": {
+      "extensions": ["vscjava.vscode-java-pack"]
+    }
+  }
+}

@@ -5,6 +5,7 @@ name: Release
 #
 # Secrets used:
 #   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN  - Docker Hub account and access token
+#                                          (Read, Write, Delete scope, needed to update the overview)
 #   TAP_GITHUB_TOKEN                     - token with write access to the tap repository
 
 on:
@@ -70,6 +71,15 @@ jobs:
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        if: env.DOCKERHUB_TOKEN != ''
+        with:
+          images: himanshmunjal/jcache
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
       - uses: docker/build-push-action@v6
         if: env.DOCKERHUB_TOKEN != ''
         with:
@@ -78,9 +88,17 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: VERSION=${{ needs.jars.outputs.version }}
-          tags: |
-            himanshmunjal/jcache:${{ needs.jars.outputs.version }}
-            himanshmunjal/jcache:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          sbom: true
+          provenance: mode=max
+      - uses: peter-evans/dockerhub-description@v4
+        if: env.DOCKERHUB_TOKEN != '' && !contains(github.ref_name, '-')
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+          repository: himanshmunjal/jcache
+          short-description: In-memory cache server with LRU, LFU and ARC eviction, TTLs and persistence
+          readme-filepath: distribution/DOCKERHUB.md
 
   homebrew:
     runs-on: ubuntu-latest
