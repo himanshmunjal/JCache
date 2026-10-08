@@ -1,795 +1,377 @@
 package com.cache.server;
 
 import com.cache.api.Cache;
-import com.cache.api.CachePolicyType;
 import com.cache.concurrent.SegmentedCache;
+import com.cache.persistence.PersistenceManager;
+import com.cache.persistence.SnapshotLoader;
 import com.cache.server.handler.CacheServerHandler;
 import com.cache.server.handler.ConnectionManager;
+import com.cache.server.handler.ProtocolDetector;
+import com.cache.server.handler.RespCommandHandler;
 import com.cache.server.metrics.ServerMetrics;
 import com.cache.ttl.TTLCache;
 import io.netty.bootstrap.ServerBootstrap;
-import io.netty.channel.*;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.handler.codec.LineBasedFrameDecoder;
-import io.netty.handler.codec.string.StringDecoder;
 import io.netty.handler.codec.string.StringEncoder;
 import io.netty.util.CharsetUtil;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
- * CacheServer is the entry point and lifecycle manager for the JCache network server.
+ * Netty TCP server that exposes a JCache instance over a line-based text
+ * protocol (see {@link com.cache.common.protocol.CommandParser}) and over
+ * RESP, so Redis clients can connect. Both are served on the same port; the
+ * first byte of a connection picks the protocol.
  *
- * WHAT THIS CLASS DOES:
- *   1. Reads configuration (from ServerConfig — built programmatically or from a file).
- *   2. Builds the cache engine from cache-core (LRU/LFU/ARC + TTL wrapper).
- *   3. Bootstraps a Netty TCP server on the configured port.
- *   4. Wires the Netty pipeline: framing → decoding → connection management → command handling.
- *   5. Registers a JVM shutdown hook for graceful shutdown on Ctrl+C or SIGTERM.
- *   6. Blocks until shutdown is requested, then releases resources cleanly.
+ * <p>The cache stack is {@code TTLCache -> SegmentedCache -> LRU/LFU/ARC}.
+ * Each connection starts with
+ * <pre>
+ * StringEncoder -&gt; ProtocolDetector -&gt; ConnectionManager
+ * </pre>
+ * and {@link ProtocolDetector} then adds either a line decoder and
+ * {@link CacheServerHandler}, or the RESP codec and {@link RespCommandHandler}.
  *
- * NETTY ARCHITECTURE — TWO THREAD GROUPS:
- *
- *   BossGroup (1 thread by default):
- *     Runs the ServerSocketChannel. Accepts incoming TCP connections.
- *     For each accepted connection, registers the new SocketChannel
- *     with a worker thread and moves on. Very lightweight.
- *
- *   WorkerGroup (8 threads by default):
- *     Each worker thread runs an event loop (NIO Selector).
- *     Handles all I/O for channels assigned to it: reading bytes,
- *     running pipeline handlers, writing responses.
- *     A channel stays on its assigned worker thread for its entire lifetime
- *     — this is what makes Netty handlers safe to write without per-channel locking.
- *
- * PIPELINE FOR EACH ACCEPTED CONNECTION:
- *
- *   Inbound (client → server):
- *     LineBasedFrameDecoder   → buffers bytes until \n, emits one frame per line
- *     StringDecoder           → converts ByteBuf frame to java.lang.String (UTF-8)
- *     ConnectionManager       → enforces max connections, tracks active channels
- *     CacheServerHandler      → parses command, calls cache engine, writes response
- *
- *   Outbound (server → client):
- *     StringEncoder           → converts String response to ByteBuf (UTF-8)
- *     (then Netty writes ByteBuf bytes to the TCP socket)
- *
- *   Why LineBasedFrameDecoder?
- *     TCP is a stream protocol — there are no message boundaries in raw bytes.
- *     A client sending "GET foo\r\n" might arrive as two reads: "GET f" then "oo\r\n".
- *     LineBasedFrameDecoder buffers bytes until it sees \n, then emits the complete
- *     line as one ByteBuf. This is the same framing Redis uses for its inline protocol.
- *
- *   Why StringDecoder/StringEncoder?
- *     Our protocol is text-based. Converting ByteBuf<->String at the codec layer
- *     keeps CacheServerHandler clean — it works with plain Java Strings.
- *
- * GRACEFUL SHUTDOWN:
- *   We register a JVM shutdown hook (Runtime.addShutdownHook) that:
- *     1. Closes all active client connections via ConnectionManager.
- *     2. Shuts down the TTL sweeper thread.
- *     3. Calls shutdownGracefully() on both Netty event loop groups.
- *     4. Signals the main thread (which is blocking on serverChannel.closeFuture())
- *        to proceed past the await and exit.
- *
- *   Why shutdownGracefully() instead of shutdown()?
- *     shutdownGracefully() waits for in-flight tasks to complete before stopping
- *     the event loop. This prevents cutting off a response mid-write.
- *     It accepts a quiet period (default 2s) and timeout (default 15s).
- *     We use shorter values for faster shutdown in test environments.
- *
- * USAGE:
- *
- *   Programmatic (tests, embedding):
- *     ServerConfig config = ServerConfig.builder().port(6379).cacheCapacity(10000).build();
- *     CacheServer server = new CacheServer(config);
- *     server.start(); // blocks until shutdown
- *
- *   From command line:
- *     java -jar jcache.jar                          # all defaults
- *     java -jar jcache.jar --port 6380              # custom port
- *     java -jar jcache.jar --config jcache.properties  # properties file
- *
- *   With Docker:
- *     docker run -p 6379:6379 yourname/jcache:latest
- *
- *   Verify with telnet:
- *     telnet localhost 6379
- *     PUT name Alice
- *     GET name
- *     STATS
- *     QUIT
+ * <p>Typical use:
+ * <pre>{@code
+ * CacheServer server = new CacheServer(ServerConfig.builder().port(0).build());
+ * server.startAsync();          // returns once the port is bound
+ * int port = server.getPort();
+ * ...
+ * server.shutdown();
+ * }</pre>
  */
 public class CacheServer {
 
-    // =========================================================================
-    // Constants
-    // =========================================================================
+    private static final Logger log = Logger.getLogger(CacheServer.class.getName());
 
-    /**
-     * Maximum bytes per line from a client.
-     * Prevents memory exhaustion if a misbehaving client sends a very long line
-     * without a newline. 8KB is generous for key+value in a text protocol.
-     */
-    private static final int MAX_LINE_LENGTH = 1024 * 1024; // 1MB
+    /** Longest accepted command line, in bytes. */
+    static final int MAX_LINE_LENGTH = 1024 * 1024;
 
-    private static final int MAX_VALUE_LENGTH = 128 * 1024; // 512KB
+    private static final long QUIET_PERIOD_MS = 200;
+    private static final long SHUTDOWN_TIMEOUT_MS = 3000;
 
-    /**
-     * Quiet period for Netty graceful shutdown (milliseconds).
-     * During this period, the event loop keeps running to process in-flight tasks.
-     * Shorter than Netty default (2000ms) for faster shutdown in tests.
-     */
-    private static final long SHUTDOWN_QUIET_PERIOD_MS = 200L;
-
-    /**
-     * Timeout for Netty graceful shutdown (milliseconds).
-     * If tasks are still running after this, shutdown is forced.
-     */
-    private static final long SHUTDOWN_TIMEOUT_MS = 3000L;
-
-    // =========================================================================
-    // Instance state
-    // =========================================================================
-
-    /** Configuration — immutable, shared safely across all threads. */
     private final ServerConfig config;
-
-    /**
-     * The cache engine — built from CacheFactory based on config.evictionPolicy.
-     * Wrapped in TTLCache for TTL support and SegmentedCache for thread safety.
-     * Shared across all CacheServerHandler instances (all client connections).
-     * Must be thread-safe — SegmentedCache provides this.
-     */
-    private final Cache<String, String> cache;
-
-    /**
-     * Server-level metrics — shared across all handler instances.
-     * Thread-safe via LongAdder and AtomicLong internally.
-     */
-    private final ServerMetrics metrics;
-
-    /**
-     * Tracks active connections and enforces maxConnections limit.
-     * Sharable handler — one instance shared across all pipelines.
-     */
+    private final TTLCache<String, String> cache;
+    private final ServerMetrics metrics = new ServerMetrics();
     private final ConnectionManager connectionManager;
+    private final PersistenceManager persistence;
 
-    /**
-     * Netty boss event loop group — accepts new connections.
-     * One thread is sufficient for any realistic workload.
-     */
-    private NioEventLoopGroup bossGroup;
-
-    /**
-     * Netty worker event loop group — handles I/O for accepted connections.
-     * Number of threads set from ServerConfig.workerThreads.
-     */
-    private NioEventLoopGroup workerGroup;
-
-    /**
-     * The bound server channel — represents the listening socket.
-     * We close this on shutdown to stop accepting new connections.
-     */
+    private final CountDownLatch started = new CountDownLatch(1);
+    private final Thread shutdownHook = new Thread(this::shutdown, "jcache-shutdown");
+    private volatile Throwable startupFailure;
+    private volatile boolean running;
+    private final AtomicBoolean startCalled = new AtomicBoolean();
+    private volatile int boundPort = -1;
+    private EventLoopGroup bossGroup;
+    private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
     /**
-     * The actual port the server is listening on.
-     * Differs from config.getPort() when port 0 was configured —
-     * in that case the OS assigns a free port and we read it here
-     * from serverChannel.localAddress() after bind() completes.
-     * Initialized to -1 before the server binds.
-     */
-    private volatile int actualPort = -1;
-
-    /**
-     * Latch used to signal the start() blocking call that shutdown is complete.
-     * Initialized to 1 in start(), counted down in shutdown().
-     * This lets us cleanly unblock start() from a shutdown hook thread.
-     */
-    private volatile CountDownLatch shutdownLatch;
-
-    /**
-     * Tracks whether the server is currently running.
-     * Prevents double-start and makes shutdown idempotent.
-     */
-    private volatile boolean running = false;
-
-    // =========================================================================
-    // Constructors
-    // =========================================================================
-
-    /**
-     * Creates a CacheServer with the given configuration.
+     * Builds the cache and, if enabled, restores it from disk. Does not open
+     * the port; call {@link #start()} or {@link #startAsync()} for that.
      *
-     * This constructor builds the cache engine and metrics immediately,
-     * but does NOT bind to any port. Call start() to begin accepting connections.
-     *
-     * @param config Server configuration. Must not be null.
+     * @param config server configuration
      */
     public CacheServer(ServerConfig config) {
         if (config == null) {
             throw new IllegalArgumentException("ServerConfig cannot be null");
         }
-        this.config  = config;
-        this.cache   = buildCache(config);
-        this.metrics = new ServerMetrics();
+        this.config = config;
+        this.cache = buildCache(config);
         this.connectionManager = new ConnectionManager(config.getMaxConnections(), metrics);
+        this.persistence = config.isPersistenceEnabled() ? openPersistence(config, cache) : null;
     }
 
-    /**
-     * Creates a CacheServer with default configuration.
-     * Equivalent to new CacheServer(ServerConfig.defaults()).
-     * Useful for quick-start and integration tests.
-     */
+    /** Creates a server with {@link ServerConfig#defaults()}. */
     public CacheServer() {
         this(ServerConfig.defaults());
     }
 
-    // =========================================================================
-    // Lifecycle
-    // =========================================================================
-
     /**
-     * Starts the server and blocks until shutdown.
+     * Binds the port and blocks until the server is shut down. A server
+     * instance can only be started once.
      *
-     * This method:
-     *   1. Creates Netty event loop groups.
-     *   2. Configures the ServerBootstrap with our pipeline.
-     *   3. Binds to the configured port.
-     *   4. Registers a JVM shutdown hook.
-     *   5. Blocks on serverChannel.closeFuture() until shutdown.
-     *   6. Returns after all resources are released.
-     *
-     * To start the server without blocking, run this method in a separate thread:
-     *   Thread serverThread = new Thread(server::start);
-     *   serverThread.setDaemon(true);
-     *   serverThread.start();
-     *
-     * @throws RuntimeException if the server fails to bind to the port.
-     *         Common causes: port in use (EADDRINUSE), insufficient privileges
-     *         for ports < 1024.
+     * @throws IllegalStateException if {@code start} was already called
+     * @throws RuntimeException      if the port cannot be bound
      */
     public void start() {
-        if (running) {
-            throw new IllegalStateException(
-                    "Server is already running on port " + actualPort);
+        if (!startCalled.compareAndSet(false, true)) {
+            throw new IllegalStateException("A CacheServer can only be started once");
         }
-
-        // Initialize shutdown latch — counted down in shutdown()
-        shutdownLatch = new CountDownLatch(1);
-
-        // Create event loop groups
-        // NioEventLoopGroup uses Java NIO Selector — non-blocking I/O,
-        // efficient for many concurrent connections with varying activity.
-        bossGroup   = new NioEventLoopGroup(config.getBossThreads());
+        bossGroup = new NioEventLoopGroup(config.getBossThreads());
         workerGroup = new NioEventLoopGroup(config.getWorkerThreads());
-
         try {
-            ServerBootstrap bootstrap = new ServerBootstrap();
-            bootstrap
+            serverChannel = new ServerBootstrap()
                     .group(bossGroup, workerGroup)
-                    // NioServerSocketChannel is the Netty abstraction over
-                    // Java's ServerSocketChannel (non-blocking TCP server socket).
                     .channel(NioServerSocketChannel.class)
-
-                    // Socket options for the server socket itself (listening socket):
-                    // SO_BACKLOG: max length of the queue of pending connections.
-                    // 128 is the Linux default; increase for very high connection rates.
                     .option(ChannelOption.SO_BACKLOG, 128)
-
-                    // Socket options for accepted child channels (client connections):
-                    // SO_KEEPALIVE: enables TCP keepalive probes. Detects dead connections
-                    //   that closed without sending FIN (e.g., network partition, crash).
-                    // TCP_NODELAY: disables Nagle's algorithm. Sends small packets immediately
-                    //   instead of buffering for 200ms. Critical for low-latency cache ops.
                     .childOption(ChannelOption.SO_KEEPALIVE, true)
                     .childOption(ChannelOption.TCP_NODELAY, true)
-
-                    // ChannelInitializer is called once per accepted connection.
-                    // It configures the pipeline for that specific channel, then
-                    // removes itself from the pipeline (it's a one-shot initializer).
                     .childHandler(new ChannelInitializer<SocketChannel>() {
                         @Override
                         protected void initChannel(SocketChannel ch) {
-                            buildPipeline(ch.pipeline());
+                            configurePipeline(ch.pipeline());
                         }
-                    });
+                    })
+                    .bind(config.getPort())
+                    .sync()
+                    .channel();
 
-            // Bind and start accepting connections.
-            // sync() blocks until the bind completes (or throws on failure).
-            ChannelFuture bindFuture = bootstrap.bind(config.getPort()).sync();
+            boundPort = ((InetSocketAddress) serverChannel.localAddress()).getPort();
+            running = true;
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
+            logStartup();
+            started.countDown();
 
-            if (!bindFuture.isSuccess()) {
-                throw new RuntimeException(
-                        "Failed to bind to port " + config.getPort(),
-                        bindFuture.cause()
-                );
-            }
-
-            serverChannel = bindFuture.channel();
-
-            // Read the actual bound port from the channel's local address.
-            // When config.getPort() == 0, the OS assigns a port and this is
-            // how we find out which one. When a specific port was configured,
-            // this just confirms it. Either way, getPort() reads actualPort.
-            actualPort = ((java.net.InetSocketAddress) serverChannel.localAddress()).getPort();
-            running    = true;
-
-            printStartupBanner();
-            registerShutdownHook();
-
-            // Block here until the server channel is closed (by shutdown()).
-            // This is the "server is running" state.
             serverChannel.closeFuture().sync();
-
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            System.err.println("[CacheServer] Server interrupted during startup or operation");
+        } catch (RuntimeException e) {
+            startupFailure = e;
+            throw e;
         } finally {
-            // These run after serverChannel.closeFuture() unblocks —
-            // i.e., after shutdown() has closed the server channel.
-            performCleanup();
-            shutdownLatch.countDown(); // signal that cleanup is complete
+            started.countDown();
+            workerGroup.shutdownGracefully(QUIET_PERIOD_MS, SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            bossGroup.shutdownGracefully(QUIET_PERIOD_MS, SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         }
     }
 
     /**
-     * Shuts down the server gracefully.
-     *
-     * Safe to call from any thread, including the JVM shutdown hook thread.
-     * Idempotent — calling shutdown() on an already-stopped server is a no-op.
-     *
-     * Shutdown sequence:
-     *   1. Stop accepting new connections (close server channel).
-     *   2. Close all existing client connections.
-     *   3. Shut down TTL sweeper if cache is a TTLCache.
-     *   4. Shut down Netty event loop groups.
-     *
-     * The start() method unblocks and returns after this method completes.
-     */
-    public void shutdown() {
-        if (!running) {
-            return; // already stopped or never started
-        }
-
-        running = false;
-        System.out.println("[CacheServer] Shutting down...");
-
-        // Step 1: Stop accepting new connections
-        if (serverChannel != null && serverChannel.isOpen()) {
-            serverChannel.close();
-        }
-
-        // Step 2: Close all existing client connections cleanly
-        connectionManager.closeAllConnections();
-
-        // Step 3: Shut down TTL sweeper if applicable
-        // TTLCache.shutdown() stops the background sweeper thread.
-        // Without this, the sweeper thread may delay JVM exit.
-        if (cache instanceof TTLCache) {
-            ((TTLCache<String, String>) cache).shutdown();
-            System.out.println("[CacheServer] TTL sweeper stopped");
-        }
-
-        System.out.println("[CacheServer] Shutdown complete");
-    }
-
-    /**
-     * Waits for the server to fully start (i.e., be bound and accepting connections).
-     * Useful in tests that start the server in a background thread and need to
-     * wait before sending commands.
-     *
-     * @return true if the server is running, false if it never started.
-     */
-    public boolean isRunning() {
-        return running;
-    }
-
-    /**
-     * Returns the port the server is actually listening on.
-     *
-     * When port 0 was configured, the OS assigns a free ephemeral port.
-     * This method returns that actual port — NOT the configured 0.
-     * Always use this method in tests, never config.getPort().
-     *
-     * Returns -1 if the server has not yet bound (i.e., start() or
-     * startAsync() has not been called yet).
-     *
-     * @return Actual bound port, or -1 if not yet started.
-     */
-    public int getPort() {
-        return actualPort;
-    }
-
-    /**
-     * Starts the server in a background daemon thread and returns immediately.
-     *
-     * This is what tests use — @BeforeAll cannot block forever waiting for
-     * start() to return, because start() only returns on shutdown.
-     *
-     * This method blocks until the server is fully bound and ready to accept
-     * connections (up to timeoutMs milliseconds), then returns.
-     * If the server fails to start within the timeout, it throws RuntimeException.
-     *
-     * Usage in tests:
-     *   server.startAsync();                   // returns as soon as server is bound
-     *   int port = server.getPort();           // safe to call — server is ready
-     *   CacheClient client = new CacheClient("localhost", port);
-     *
-     * @param timeoutMs Maximum milliseconds to wait for the server to bind.
-     * @throws RuntimeException if the server does not start within timeoutMs.
-     */
-    public void startAsync(long timeoutMs) {
-        Thread serverThread = new Thread(this::start, "jcache-server-main");
-        serverThread.setDaemon(true); // won't block JVM exit if tests finish
-        serverThread.start();
-
-        // Poll until running == true (actualPort is set) or timeout elapses.
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (!running && System.currentTimeMillis() < deadline) {
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("Interrupted while waiting for server to start");
-            }
-        }
-
-        if (!running) {
-            throw new RuntimeException(
-                    "Server did not start within " + timeoutMs + "ms"
-            );
-        }
-    }
-
-    /**
-     * Starts the server asynchronously with a default 5-second timeout.
-     * Equivalent to startAsync(5000).
+     * Starts the server on a background thread and waits up to five seconds
+     * for the port to be bound.
      */
     public void startAsync() {
         startAsync(5000);
     }
 
     /**
-     * Returns the ServerMetrics instance for this server.
-     * Used by tests to assert on hit counts, error counts, etc.
+     * Starts the server on a background thread and waits for the port to be bound.
      *
-     * @return The metrics collector.
+     * @param timeoutMs how long to wait
+     * @throws IllegalStateException if the server failed to start or did not
+     *                               start in time
      */
+    public void startAsync(long timeoutMs) {
+        Thread thread = new Thread(() -> {
+            try {
+                start();
+            } catch (RuntimeException e) {
+                log.log(Level.SEVERE, "Server failed to start", e);
+            }
+        }, "jcache-server");
+        thread.setDaemon(true);
+        thread.start();
+        try {
+            if (!started.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                throw new IllegalStateException("Server did not start within " + timeoutMs + " ms");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for the server to start", e);
+        }
+        if (!running) {
+            throw new IllegalStateException("Server failed to start on port " + config.getPort(), startupFailure);
+        }
+    }
+
+    /**
+     * Stops accepting connections, closes the open ones, stops the TTL sweeper
+     * and writes a final snapshot. Safe to call more than once and from any thread.
+     */
+    public synchronized void shutdown() {
+        if (!running) {
+            return;
+        }
+        running = false;
+        log.info("Shutting down");
+        if (Thread.currentThread() != shutdownHook) {
+            try {
+                Runtime.getRuntime().removeShutdownHook(shutdownHook);
+            } catch (IllegalStateException e) {
+                // The JVM is already shutting down; the hook will run regardless.
+            }
+        }
+        serverChannel.close().syncUninterruptibly();
+        connectionManager.closeAllConnections();
+        cache.shutdown();
+        if (persistence != null) {
+            persistence.close();
+        }
+        log.info("Shutdown complete");
+    }
+
+    /** @return whether the server is accepting connections */
+    public boolean isRunning() {
+        return running;
+    }
+
+    /**
+     * Returns the port the server is listening on. When configured with port
+     * 0 this is the port the operating system picked.
+     *
+     * @return the bound port, or -1 before the server has started
+     */
+    public int getPort() {
+        return boundPort;
+    }
+
+    /** @return the server's metrics */
     public ServerMetrics getMetrics() {
         return metrics;
     }
 
-    /**
-     * Returns the ConnectionManager.
-     * Used by tests to assert on active connection counts.
-     *
-     * @return The connection manager.
-     */
+    /** @return the connection manager */
     public ConnectionManager getConnectionManager() {
         return connectionManager;
     }
 
-    // =========================================================================
-    // main() — command-line entry point
-    // =========================================================================
-
     /**
-     * Command-line entry point.
+     * Command-line entry point. See {@link #usage()} for the flags.
      *
-     * Supported arguments:
-     *   (no args)                    → start with all defaults
-     *   --port <number>              → override port
-     *   --config <path>              → load config from properties file
-     *   --capacity <number>          → override cache capacity
-     *   --policy <LRU|LFU|ARC|FIFO> → override eviction policy
-     *   --verbose                    → enable verbose logging
-     *
-     * Examples:
-     *   java -jar jcache.jar
-     *   java -jar jcache.jar --port 6380 --capacity 50000
-     *   java -jar jcache.jar --config /etc/jcache/jcache.properties
-     *
-     * @param args Command-line arguments.
+     * @param args command-line arguments
      */
     public static void main(String[] args) {
-        ServerConfig config = parseArgs(args);
-        CacheServer server  = new CacheServer(config);
-        server.start(); // blocks until shutdown
-    }
-
-    // =========================================================================
-    // Private — pipeline construction
-    // =========================================================================
-
-    /**
-     * Configures the Netty pipeline for a newly accepted client connection.
-     *
-     * Handler order matters. Inbound handlers fire top-to-bottom.
-     * Outbound handlers (StringEncoder) fire bottom-to-top.
-     *
-     * Pipeline (inbound direction, top to bottom):
-     *   1. LineBasedFrameDecoder — splits byte stream into lines
-     *   2. StringDecoder         — converts ByteBuf to String
-     *   3. StringEncoder         — converts String back to ByteBuf (outbound)
-     *   4. ConnectionManager     — enforces limits, tracks channels
-     *   5. CacheServerHandler    — command dispatch, cache calls, response
-     *
-     * We create a new CacheServerHandler per connection (not sharable).
-     * ConnectionManager is sharable — one instance for the whole server.
-     *
-     * @param pipeline The pipeline of the newly accepted SocketChannel.
-     */
-    private void buildPipeline(ChannelPipeline pipeline) {
-        // Framing: split TCP byte stream into lines.
-        // MAX_LINE_LENGTH prevents memory exhaustion on runaway clients.
-        // stripDelimiter=true removes the \n from the emitted ByteBuf.
-        pipeline.addLast("framer",
-                new LineBasedFrameDecoder(MAX_LINE_LENGTH, true, true));
-
-        // Decode ByteBuf → String using UTF-8
-        pipeline.addLast("decoder",
-                new StringDecoder(CharsetUtil.UTF_8));
-
-        // Encode String → ByteBuf using UTF-8 (for outbound responses)
-        // Added before ConnectionManager so it's available throughout the pipeline.
-        pipeline.addLast("encoder",
-                new StringEncoder(CharsetUtil.UTF_8));
-
-        // Connection management — SHARABLE, single instance for all connections.
-        // Must come BEFORE CacheServerHandler so limits are enforced before
-        // any commands are processed.
-        pipeline.addLast("connectionManager", connectionManager);
-
-        // Command handler — NOT sharable, one instance per connection.
-        // Receives clean Strings, dispatches to cache engine, writes responses.
-        pipeline.addLast("handler",
-                new CacheServerHandler(cache, metrics, config));
-    }
-
-    // =========================================================================
-    // Private — cache construction
-    // =========================================================================
-
-    /**
-     * Builds the cache engine from configuration.
-     *
-     * The cache stack (from outer to inner):
-     *   TTLCache (TTL expiry decorator)
-     *     SegmentedCache (thread-safe wrapper, 16 segments)
-     *       LRUCache / LFUCache / ARCCache (eviction policy)
-     *
-     * Why this order?
-     *   - The policy cache is pure logic, not thread-safe.
-     *   - SegmentedCache wraps it to make it thread-safe.
-     *   - TTLCache wraps the thread-safe cache to add expiry behaviour.
-     *   - CacheServerHandler sees Cache<String, String> — the full stack.
-     *
-     * CacheFactory.withTTL and CacheFactory.withSegmented are convenience
-     * methods that apply these wrappers. We call them in the correct order here.
-     *
-     * @param config The server configuration specifying policy and capacity.
-     * @return A fully configured, thread-safe, TTL-aware cache.
-     */
-    private static Cache<String, String> buildCache(ServerConfig config) {
-        int capacity = config.getCacheCapacity();
-
-        // Map CachePolicyType enum → SegmentedCache.PolicyType enum.
-        // SegmentedCache does NOT accept a Cache delegate — it creates its own
-        // internal cache per segment using its own PolicyType enum.
-        // This is why we cannot pass a pre-built LRUCache/LFUCache/ARCCache in.
-        SegmentedCache.PolicyType segmentPolicy;
-        switch (config.getEvictionPolicy()) {
-            case LFU:  segmentPolicy = SegmentedCache.PolicyType.LFU; break;
-            case ARC:  segmentPolicy = SegmentedCache.PolicyType.ARC; break;
-            case LRU:  // fall through
-            default:   segmentPolicy = SegmentedCache.PolicyType.LRU; break;
+        if (System.getProperty("java.util.logging.SimpleFormatter.format") == null) {
+            System.setProperty("java.util.logging.SimpleFormatter.format", "%1$tF %1$tT %4$-7s %3$s - %5$s%6$s%n");
         }
-
-        // Build SegmentedCache directly with (totalCapacity, numSegments, policy).
-        // - totalCapacity: from ServerConfig — total entries across ALL segments
-        // - numSegments:   16 — each segment gets capacity/16 entries
-        // - policy:        mapped above from config.getEvictionPolicy()
-        //
-        // DO NOT pass base.size() — size() is the current entry count (0 at startup).
-        // DO NOT pass a Cache delegate — SegmentedCache creates its own per-segment caches.
-        Cache<String, String> threadSafe = new SegmentedCache<>(capacity, 16, segmentPolicy);
-
-        // Wrap with TTLCache using the (Cache, long) constructor.
-        // long = sweepIntervalMs, NOT a java.time.Duration.
-        TTLCache<String, String> withTTL = new TTLCache<>(
-                threadSafe,
-                config.getSweepIntervalMs()
-        );
-
-        System.out.printf("[CacheServer] Cache built: policy=%s, capacity=%d, " +
-                        "sweepInterval=%dms%n",
-                config.getEvictionPolicy(),
-                config.getCacheCapacity(),
-                config.getSweepIntervalMs()
-        );
-
-        return withTTL;
-    }
-
-    // =========================================================================
-    // Private — shutdown infrastructure
-    // =========================================================================
-
-    /**
-     * Registers a JVM shutdown hook that calls shutdown() when the JVM exits.
-     *
-     * The shutdown hook runs when:
-     *   - The user presses Ctrl+C (SIGINT)
-     *   - The process receives SIGTERM (Docker stop, kill)
-     *   - System.exit() is called from application code
-     *   - The last non-daemon thread exits
-     *
-     * WHY A SHUTDOWN HOOK?
-     *   Without this, Ctrl+C would kill the JVM immediately, leaving Netty threads
-     *   running and client connections open. The hook gives us ~30 seconds
-     *   (default JVM shutdown timeout) to clean up.
-     *
-     * CAUTION:
-     *   Shutdown hooks run concurrently with each other and with application threads.
-     *   Our shutdown() method is idempotent and uses volatile/atomic state,
-     *   so concurrent calls are safe.
-     */
-    private void registerShutdownHook() {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("[CacheServer] Shutdown hook triggered");
-            shutdown();
-        }, "jcache-shutdown-hook"));
-    }
-
-    /**
-     * Releases Netty resources after the server channel has been closed.
-     *
-     * shutdownGracefully() with our shorter quiet period and timeout values
-     * ensures tests don't wait the full Netty default (2s quiet, 15s timeout)
-     * during teardown.
-     *
-     * This method is called from the finally block in start(), so it always
-     * runs whether start() exits normally or via exception/interrupt.
-     */
-    private void performCleanup() {
-        if (workerGroup != null) {
-            workerGroup.shutdownGracefully(SHUTDOWN_QUIET_PERIOD_MS,
-                    SHUTDOWN_TIMEOUT_MS,
-                    java.util.concurrent.TimeUnit.MILLISECONDS);
+        ServerConfig config;
+        try {
+            config = parseArgs(args);
+        } catch (IllegalArgumentException | UncheckedIOException e) {
+            System.err.println("Error: " + e.getMessage());
+            System.err.println(usage());
+            System.exit(2);
+            return;
         }
-        if (bossGroup != null) {
-            bossGroup.shutdownGracefully(SHUTDOWN_QUIET_PERIOD_MS,
-                    SHUTDOWN_TIMEOUT_MS,
-                    java.util.concurrent.TimeUnit.MILLISECONDS);
+        if (config == null) {
+            System.out.println(usage());
+            return;
         }
-        System.out.println("[CacheServer] Netty event loops stopped");
+        new CacheServer(config).start();
     }
 
-    // =========================================================================
-    // Private — startup banner
-    // =========================================================================
-
     /**
-     * Prints a startup banner to stdout when the server is ready to accept connections.
+     * Builds the configuration from the properties file named by
+     * {@code --config} (if any), then {@code JCACHE_*} environment variables,
+     * then the remaining flags.
      *
-     * This is the visible confirmation that everything worked.
-     * Matches the style of Redis's startup output — operators know to look for this.
+     * @return the configuration, or {@code null} if {@code --help} was given
      */
-    private void printStartupBanner() {
-        System.out.println("==========================================");
-        System.out.println("  JCache Server started successfully");
-        System.out.println("==========================================");
-        System.out.printf("  Port      : %d%n",   config.getPort());
-        System.out.printf("  Policy    : %s%n",   config.getEvictionPolicy());
-        System.out.printf("  Capacity  : %,d%n",  config.getCacheCapacity());
-        System.out.printf("  Workers   : %d%n",   config.getWorkerThreads());
-        System.out.printf("  Max Conn  : %,d%n",  config.getMaxConnections());
-        System.out.printf("  Verbose   : %b%n",   config.isVerbose());
-        System.out.printf("  Persist   : %b%n",   config.isPersistenceEnabled());
-        System.out.println("==========================================");
-        System.out.println("  Ready to accept connections");
-        System.out.println("  Use Ctrl+C or SIGTERM to stop");
-        System.out.println("==========================================");
-    }
-
-    // =========================================================================
-    // Private — command-line argument parsing
-    // =========================================================================
-
-    /**
-     * Parses command-line arguments into a ServerConfig.
-     *
-     * Supported flags:
-     *   --config <path>              Load from properties file (other flags override)
-     *   --port <number>              Override port
-     *   --capacity <number>          Override cache capacity
-     *   --policy <LRU|LFU|ARC|FIFO> Override eviction policy
-     *   --verbose                    Enable verbose logging
-     *
-     * @param args Command-line arguments from main().
-     * @return Configured ServerConfig.
-     */
-    private static ServerConfig parseArgs(String[] args) {
-        if (args.length == 0) {
-            return ServerConfig.defaults();
-        }
-
-        // Check for --config first — it loads a base config we can then override
-        String configPath = null;
+    static ServerConfig parseArgs(String[] args) {
+        ServerConfig.Builder builder = ServerConfig.builder();
         for (int i = 0; i < args.length - 1; i++) {
             if ("--config".equals(args[i])) {
-                configPath = args[i + 1];
-                break;
+                builder.applyProperties(args[i + 1]);
             }
         }
+        builder.applyEnvironment(System.getenv());
 
-        ServerConfig.Builder builder = (configPath != null)
-                ? rebuildFromConfig(configPath)
-                : ServerConfig.builder();
-
-        // Apply individual flag overrides on top of the base config
         for (int i = 0; i < args.length; i++) {
-            switch (args[i]) {
-                case "--port":
-                    if (i + 1 < args.length) {
-                        builder.port(Integer.parseInt(args[++i]));
+            String flag = args[i];
+            switch (flag) {
+                case "--help", "-h" -> {
+                    return null;
+                }
+                case "--verbose" -> builder.verbose(true);
+                case "--persist" -> builder.persistenceEnabled(true);
+                case "--config", "--port", "--capacity", "--policy", "--segments", "--default-ttl", "--data-dir",
+                     "--rate-limit", "--rate-limit-burst" -> {
+                    if (i + 1 >= args.length) {
+                        throw new IllegalArgumentException(flag + " needs a value");
                     }
-                    break;
-                case "--capacity":
-                    if (i + 1 < args.length) {
-                        builder.cacheCapacity(Integer.parseInt(args[++i]));
+                    String value = args[++i];
+                    switch (flag) {
+                        case "--port" -> builder.port(Integer.parseInt(value));
+                        case "--capacity" -> builder.cacheCapacity(Integer.parseInt(value));
+                        case "--policy" -> builder.evictionPolicy(value);
+                        case "--segments" -> builder.segments(Integer.parseInt(value));
+                        case "--default-ttl" -> builder.defaultTtlSeconds(Long.parseLong(value));
+                        case "--data-dir" -> builder.snapshotPath(value);
+                        case "--rate-limit" -> builder.rateLimitPerSecond(Integer.parseInt(value));
+                        case "--rate-limit-burst" -> builder.rateLimitBurst(Integer.parseInt(value));
+                        default -> { } // --config was applied first
                     }
-                    break;
-                case "--policy":
-                    if (i + 1 < args.length) {
-                        try {
-                            builder.evictionPolicy(
-                                    com.cache.api.CachePolicyType.valueOf(args[++i].toUpperCase()));
-                        } catch (IllegalArgumentException e) {
-                            System.err.printf("[CacheServer] Unknown policy: %s, using LRU%n", args[i]);
-                        }
-                    }
-                    break;
-                case "--verbose":
-                    builder.verbose(true);
-                    break;
-                case "--config":
-                    i++; // already handled above, skip the value
-                    break;
-                default:
-                    System.err.printf("[CacheServer] Unknown argument: %s (ignored)%n", args[i]);
+                }
+                default -> throw new IllegalArgumentException("Unknown option: " + flag);
             }
         }
-
         return builder.build();
     }
 
-    /**
-     * Loads config from a properties file and returns a Builder with those values,
-     * ready for further command-line overrides.
-     *
-     * We cannot directly get a Builder from fromProperties() (it returns ServerConfig),
-     * so we load the config and re-apply its values to a new Builder.
-     *
-     * @param path Path to the properties file.
-     * @return Builder populated from the properties file.
-     */
-    private static ServerConfig.Builder rebuildFromConfig(String path) {
-        ServerConfig loaded = ServerConfig.fromProperties(path);
-        return ServerConfig.builder()
-                .port(loaded.getPort())
-                .bossThreads(loaded.getBossThreads())
-                .workerThreads(loaded.getWorkerThreads())
-                .maxConnections(loaded.getMaxConnections())
-                .cacheCapacity(loaded.getCacheCapacity())
-                .evictionPolicy(loaded.getEvictionPolicy())
-                .sweepIntervalMs(loaded.getSweepIntervalMs())
-                .persistenceEnabled(loaded.isPersistenceEnabled())
-                .snapshotPath(loaded.getSnapshotPath())
-                .verbose(loaded.isVerbose());
+    static String usage() {
+        return String.join(System.lineSeparator(),
+                "Usage: java -jar cache-server.jar [options]",
+                "",
+                "  --port <n>          TCP port (default 6379)",
+                "  --capacity <n>      maximum number of keys (default 10000)",
+                "  --policy <name>     LRU, LFU or ARC (default LRU)",
+                "  --segments <n>      lock segments, a power of two (default 16)",
+                "  --default-ttl <s>   TTL in seconds for writes without one (default 0 = none)",
+                "  --rate-limit <n>    commands per second per connection (default 0 = no limit)",
+                "  --rate-limit-burst <n>  commands a connection may send at once (default = rate)",
+                "  --persist           enable snapshot + append-only-file persistence",
+                "  --data-dir <path>   persistence directory (default ./jcache-data)",
+                "  --config <file>     read settings from a properties file",
+                "  --verbose           log every command",
+                "",
+                "Every option can also be set with a JCACHE_* environment variable; see the README.");
+    }
+
+    private void configurePipeline(ChannelPipeline pipeline) {
+        pipeline.addLast(new StringEncoder(CharsetUtil.UTF_8));
+        pipeline.addLast(new ProtocolDetector(MAX_LINE_LENGTH,
+                () -> new CacheServerHandler(cache, metrics, config, persistence),
+                () -> new RespCommandHandler(cache, metrics, config, persistence)));
+        pipeline.addLast(connectionManager);
+    }
+
+    private static TTLCache<String, String> buildCache(ServerConfig config) {
+        Cache<String, String> segmented = new SegmentedCache<>(
+                config.getCacheCapacity(), config.getSegments(), config.getEvictionPolicy());
+        // The handler passes the default TTL explicitly so it can also log it to the AOF.
+        return new TTLCache<>(segmented, config.getSweepIntervalMs(), Duration.ZERO);
+    }
+
+    private static PersistenceManager openPersistence(ServerConfig config, TTLCache<String, String> cache) {
+        Path dir = Path.of(config.getSnapshotPath());
+        Cache<String, String> persistable = TTLCache.asPersistable(cache);
+        SnapshotLoader.LoadResult recovery = new SnapshotLoader(dir, persistable).load();
+        log.info("Recovered from " + dir.toAbsolutePath() + ": " + recovery);
+        try {
+            return new PersistenceManager(dir, persistable, config.getSnapshotIntervalMs());
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot open data directory " + dir.toAbsolutePath(), e);
+        }
+    }
+
+    private void logStartup() {
+        log.info(startupMessage(boundPort, config));
+    }
+
+    /** The startup log line; it lists the settings an operator most often needs to confirm. */
+    static String startupMessage(int port, ServerConfig config) {
+        String rateLimit = config.getRateLimitPerSecond() == 0 ? "off"
+                : config.getRateLimitPerSecond() + "/s burst " + config.getRateLimitBurst();
+        return String.format("JCache listening on port %d (policy=%s, capacity=%,d, segments=%d, "
+                        + "defaultTtl=%ds, workers=%d, maxConnections=%,d, rateLimit=%s, persistence=%s)",
+                port, config.getEvictionPolicy(), config.getCacheCapacity(), config.getSegments(),
+                config.getDefaultTtlSeconds(), config.getWorkerThreads(), config.getMaxConnections(), rateLimit,
+                config.isPersistenceEnabled() ? Path.of(config.getSnapshotPath()).toAbsolutePath() : "off");
     }
 }

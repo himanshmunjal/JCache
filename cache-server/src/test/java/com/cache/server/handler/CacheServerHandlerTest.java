@@ -14,46 +14,8 @@ import org.junit.jupiter.api.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Unit tests for CacheServerHandler using Netty's EmbeddedChannel.
- *
- * ROOT CAUSE OF THE ClassCastException (PooledUnsafeDirectByteBuf → String):
- *
- *   StringEncoder converts String → ByteBuf for sending over a real TCP socket.
- *   In EmbeddedChannel, there is no real socket. The ByteBuf produced by
- *   StringEncoder lands directly in the outbound queue. When you call
- *   channel.readOutbound(), you get that raw ByteBuf — NOT a String.
- *
- *   Casting it to String with (String) channel.readOutbound() throws ClassCastException.
- *
- * THE FIX:
- *   Read the outbound ByteBuf explicitly, convert it to String using
- *   buf.toString(CharsetUtil.UTF_8), then release() the ByteBuf to
- *   prevent memory leaks. This is what the send() helper now does.
- *
- * PIPELINE EXPLANATION:
- *   Inbound  (client → server): writeInbound(String)
- *     → LineBasedFrameDecoder frames on \n
- *     → StringDecoder converts ByteBuf → String
- *     → CacheServerHandler.channelRead0() receives String, calls cache,
- *       calls ctx.writeAndFlush(String response)
- *
- *   Outbound (server → client): ctx.writeAndFlush(String)
- *     → StringEncoder converts String → ByteBuf
- *     → ByteBuf sits in EmbeddedChannel's outbound queue
- *     → readOutboundAsString() reads ByteBuf, converts to String, releases ByteBuf
- *
- * NO SERVER NEEDED:
- *   EmbeddedChannel is 100% in-memory. No ports, no TCP, no network.
- *   No need to start CacheServer before running these tests.
- */
 @DisplayName("CacheServerHandler Tests")
 class CacheServerHandlerTest {
-
-    // -------------------------------------------------------------------------
-    // Test infrastructure
-    // -------------------------------------------------------------------------
-
     private EmbeddedChannel channel;
     private Cache<String, String> cache;
     private ServerMetrics metrics;
@@ -75,35 +37,10 @@ class CacheServerHandlerTest {
 
     @AfterEach
     void tearDown() {
-        // Releases all pending ByteBufs in inbound/outbound queues.
-        // Without this, Netty logs memory leak warnings for every unread response.
         channel.finishAndReleaseAll();
     }
 
-    // -------------------------------------------------------------------------
-    // Core helper methods
-    // -------------------------------------------------------------------------
-
-    /**
-     * Reads the next outbound message from the EmbeddedChannel as a String.
-     *
-     * WHY NOT just cast readOutbound() to String?
-     *   StringEncoder converts the handler's String response → ByteBuf.
-     *   EmbeddedChannel stores that ByteBuf in the outbound queue.
-     *   readOutbound() returns Object — the actual runtime type is ByteBuf.
-     *   Casting to String throws ClassCastException.
-     *
-     * THE RIGHT APPROACH:
-     *   1. Read the outbound object — it is a ByteBuf.
-     *   2. Convert ByteBuf → String using buf.toString(CharsetUtil.UTF_8).
-     *   3. Call buf.release() to return the ByteBuf to Netty's pool.
-     *      Skipping release() causes "LEAK: ByteBuf.release() was not called" warnings.
-     *
-     * @return The response String, or null if no outbound message is queued.
-     */
     private String readOutboundAsString() {
-        // readOutbound() returns the raw object in the outbound queue.
-        // Generic type is erased at runtime — we must handle ByteBuf explicitly.
         Object outbound = channel.readOutbound();
         if (outbound == null) {
             return null;
@@ -112,31 +49,15 @@ class CacheServerHandlerTest {
         if (outbound instanceof ByteBuf) {
             ByteBuf buf = (ByteBuf) outbound;
             try {
-                // Convert the ByteBuf bytes to a String using the same charset
-                // that StringEncoder used to write them.
                 return buf.toString(CharsetUtil.UTF_8);
             } finally {
-                // ALWAYS release in a finally block.
-                // If toString() throws (it won't for UTF-8, but defensive coding),
-                // the buffer is still released and we don't leak memory.
                 buf.release();
             }
         }
 
-        // If somehow a String ends up in the queue (no encoder in pipeline),
-        // handle it gracefully instead of crashing.
         return outbound.toString();
     }
 
-    /**
-     * Sends a command through the full Netty pipeline and returns the String response.
-     *
-     * Appends "\n" so LineBasedFrameDecoder recognizes the end of the command.
-     * Without "\n", the command sits buffered and channelRead0() is never called.
-     *
-     * @param command Command string without trailing newline.
-     * @return The String response from CacheServerHandler.
-     */
     private String send(String command) {
         channel.writeInbound(command + "\n");
         String response = readOutboundAsString();
@@ -152,9 +73,6 @@ class CacheServerHandlerTest {
         return response;
     }
 
-    /**
-     * Sends a command and asserts the response starts with "+".
-     */
     private String sendExpectSuccess(String command) {
         String response = send(command);
         assertTrue(response.startsWith("+"),
@@ -162,9 +80,6 @@ class CacheServerHandlerTest {
         return response;
     }
 
-    /**
-     * Sends a command and asserts the response starts with "-ERR".
-     */
     private String sendExpectError(String command) {
         String response = send(command);
         assertTrue(response.startsWith("-ERR"),
@@ -172,20 +87,11 @@ class CacheServerHandlerTest {
         return response;
     }
 
-    /**
-     * Discards N outbound responses without asserting.
-     * Use after commands whose +OK response you don't need to check,
-     * so the outbound queue is empty before the next assertion.
-     */
     private void drainOutbound(int count) {
         for (int i = 0; i < count; i++) {
-            readOutboundAsString(); // read and discard
+            readOutboundAsString();
         }
     }
-
-    // -------------------------------------------------------------------------
-    // 1. PING
-    // -------------------------------------------------------------------------
 
     @Test
     @DisplayName("PING returns +PONG\\r\\n")
@@ -210,10 +116,6 @@ class CacheServerHandlerTest {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // 2. GET
-    // -------------------------------------------------------------------------
-
     @Test
     @DisplayName("GET on missing key returns -ERR key not found")
     void testGet_missingKey_returnsError() {
@@ -226,7 +128,7 @@ class CacheServerHandlerTest {
     @DisplayName("GET after PUT returns the stored value")
     void testGet_afterPut_returnsValue() {
         send("PUT name Alice");
-        drainOutbound(1); // discard +OK from PUT
+        drainOutbound(1);
 
         String response = sendExpectSuccess("GET name");
         assertTrue(response.contains("Alice"),
@@ -254,7 +156,6 @@ class CacheServerHandlerTest {
         send("PUT MyKey value1");
         drainOutbound(1);
 
-        // "mykey" != "MyKey"
         sendExpectError("GET mykey");
     }
 
@@ -264,7 +165,7 @@ class CacheServerHandlerTest {
         send("PUT key val");
         drainOutbound(1);
 
-        send("GET key"); // cache hit
+        send("GET key");
         drainOutbound(1);
 
         ServerMetrics.MetricsSnapshot snap = metrics.snapshot();
@@ -275,17 +176,13 @@ class CacheServerHandlerTest {
     @Test
     @DisplayName("GET records miss in metrics")
     void testGet_recordsMiss() {
-        send("GET doesnotexist"); // cache miss
+        send("GET doesnotexist");
         drainOutbound(1);
 
         ServerMetrics.MetricsSnapshot snap = metrics.snapshot();
         assertEquals(0, snap.hits,   "Should record 0 hits");
         assertEquals(1, snap.misses, "Should record 1 miss");
     }
-
-    // -------------------------------------------------------------------------
-    // 3. PUT
-    // -------------------------------------------------------------------------
 
     @Test
     @DisplayName("PUT returns +OK\\r\\n")
@@ -337,10 +234,6 @@ class CacheServerHandlerTest {
         assertEquals(3, metrics.snapshot().totalPuts);
     }
 
-    // -------------------------------------------------------------------------
-    // 4. DELETE
-    // -------------------------------------------------------------------------
-
     @Test
     @DisplayName("DELETE returns +OK")
     void testDelete_returnsOK() {
@@ -351,7 +244,7 @@ class CacheServerHandlerTest {
     }
 
     @Test
-    @DisplayName("DELETE removes key — GET returns error after")
+    @DisplayName("DELETE removes key: GET returns error after")
     void testDelete_removesKey() {
         send("PUT key val");
         send("DELETE key");
@@ -391,10 +284,6 @@ class CacheServerHandlerTest {
         assertEquals(1, metrics.snapshot().totalDeletes);
     }
 
-    // -------------------------------------------------------------------------
-    // 5. STATS
-    // -------------------------------------------------------------------------
-
     @Test
     @DisplayName("STATS returns + prefixed response")
     void testStats_returnsSuccess() {
@@ -422,10 +311,10 @@ class CacheServerHandlerTest {
     @Test
     @DisplayName("STATS reflects accurate operation counts")
     void testStats_accurateCounts() {
-        send("PUT a 1");  // put 1
-        send("PUT b 2");  // put 2
-        send("GET a");    // hit 1
-        send("GET c");    // miss 1
+        send("PUT a 1");
+        send("PUT b 2");
+        send("GET a");
+        send("GET c");
         drainOutbound(4);
 
         String stats = send("STATS");
@@ -435,19 +324,11 @@ class CacheServerHandlerTest {
         assertTrue(stats.contains("gets:2"),   "Expected gets:2 in:   " + stats);
     }
 
-    // -------------------------------------------------------------------------
-    // 6. FLUSH
-    // -------------------------------------------------------------------------
-
     @Test
     @DisplayName("FLUSH returns +OK")
     void testFlush_returnsOK() {
         assertEquals("+OK\r\n", send("FLUSH"));
     }
-
-    // -------------------------------------------------------------------------
-    // 7. Unknown commands and edge cases
-    // -------------------------------------------------------------------------
 
     @Test
     @DisplayName("Unknown command returns -ERR")
@@ -470,7 +351,6 @@ class CacheServerHandlerTest {
     void testEmptyLine_noResponse() {
         channel.writeInbound("\n");
 
-        // readOutboundAsString() returns null when nothing is queued
         assertNull(readOutboundAsString(),
                 "Empty line should produce no response");
     }
@@ -483,10 +363,6 @@ class CacheServerHandlerTest {
         assertNull(readOutboundAsString(),
                 "Whitespace-only line should produce no response");
     }
-
-    // -------------------------------------------------------------------------
-    // 8. Multi-command sequences
-    // -------------------------------------------------------------------------
 
     @Test
     @DisplayName("PUT → GET → DELETE sequence is consistent")
@@ -517,7 +393,7 @@ class CacheServerHandlerTest {
     }
 
     @Test
-    @DisplayName("Multiple overwrites — GET returns final value")
+    @DisplayName("Multiple overwrites: GET returns final value")
     void testOverwrite_finalValueCorrect() {
         send("PUT counter 1");
         send("PUT counter 2");
@@ -528,21 +404,17 @@ class CacheServerHandlerTest {
                 "After 3 overwrites, GET should return '3'");
     }
 
-    // -------------------------------------------------------------------------
-    // 9. Metrics accuracy
-    // -------------------------------------------------------------------------
-
     @Test
     @DisplayName("All metrics counters accurate under mixed operations")
     void testMetrics_allCountersAccurate() {
-        send("PUT a 1");      // put 1
-        send("PUT b 2");      // put 2
-        send("PUT c 3");      // put 3
-        send("GET a");        // hit 1
-        send("GET b");        // hit 2
-        send("GET z");        // miss 1
-        send("DELETE a");     // delete 1
-        send("BADCOMMAND");   // error 1
+        send("PUT a 1");
+        send("PUT b 2");
+        send("PUT c 3");
+        send("GET a");
+        send("GET b");
+        send("GET z");
+        send("DELETE a");
+        send("BADCOMMAND");
         drainOutbound(8);
 
         ServerMetrics.MetricsSnapshot snap = metrics.snapshot();
@@ -554,7 +426,6 @@ class CacheServerHandlerTest {
         assertEquals(1, snap.totalDeletes, "deletes");
         assertEquals(1, snap.errors,       "errors");
 
-        // hit rate = 2/3 = 66.67%
         assertEquals(66.67, snap.hitRate, 0.1, "hit rate");
     }
 
@@ -575,10 +446,6 @@ class CacheServerHandlerTest {
         assertTrue(snap.p99Ms  >= snap.p50Ms,
                 "p99 must be >= p50, got p50=" + snap.p50Ms + " p99=" + snap.p99Ms);
     }
-
-    // -------------------------------------------------------------------------
-    // 10. Case insensitivity for command verbs
-    // -------------------------------------------------------------------------
 
     @Test
     @DisplayName("All command verbs work in lowercase")
