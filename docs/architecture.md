@@ -102,14 +102,21 @@ the last few writes.
 ## Server
 
 The server is a Netty application with one acceptor thread and
-`JCACHE_THREADS` I/O threads. Each connection gets this pipeline:
+`JCACHE_THREADS` I/O threads. Each connection starts with this pipeline:
 
 ```
-LineBasedFrameDecoder  split the byte stream into lines (max 1 MiB)
-StringDecoder/Encoder  UTF-8
+StringEncoder          UTF-8, for text replies
+ProtocolDetector       reads the first byte, installs one of the codecs below, removes itself
 ConnectionManager      shared; enforces JCACHE_MAX_CONNECTIONS and tracks open channels
-CacheServerHandler     per connection; parses with CommandParser and runs the command
 ```
+
+A first byte of `*` starts a RESP array, so the detector adds `RespDecoder`,
+`RespEncoder` and `RespCommandHandler`. Anything else is the text protocol:
+`LineBasedFrameDecoder` (max 1 MiB per line), `StringDecoder` and
+`CacheServerHandler`. Both handlers parse their own syntax, apply the
+connection's rate limit (`JCACHE_RATE_LIMIT`) and hand the command to a
+`CommandExecutor`, which owns the cache, persistence and metrics calls, so the
+two protocols cannot drift apart in behaviour.
 
 Commands are executed directly on the I/O thread. That is safe because every
 cache operation is short and non-blocking, apart from the brief pause while a
@@ -149,5 +156,5 @@ There is no replication: each key lives on exactly one server.
   large caches.
 - `SegmentedCache` evicts per segment, so the evicted entry is the least
   recently used in its segment, not necessarily in the whole cache.
-- Values cannot contain line breaks over the text protocol.
+- Values cannot contain line breaks over the text protocol; use RESP for those.
 - There is no authentication or TLS; run the server on a trusted network.
