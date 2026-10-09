@@ -14,7 +14,7 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 cd "$(dirname "$SELF")/../.."
 
 IMAGE=himanshmunjal/jcache
-CLIENT_JAR=cache-client/target/cache-client-1.0.3.jar
+CLIENT_JAR=cache-client/target/cache-client-1.0.4.jar
 NODES=(node-1:localhost:6379 node-2:localhost:6380 node-3:localhost:6381)
 
 type_delay=0.04

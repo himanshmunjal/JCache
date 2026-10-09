@@ -37,7 +37,7 @@ From source (JDK 17 or newer, Maven 3.8+):
 git clone https://github.com/himanshmunjal/JCache.git
 cd JCache
 mvn package -DskipTests
-java -jar cache-server/target/cache-server-1.0.3.jar
+java -jar cache-server/target/cache-server-1.0.4.jar
 ```
 
 Then talk to it:
@@ -59,7 +59,7 @@ STATS
 or use the interactive client:
 
 ```bash
-java -jar cache-client/target/cache-client-1.0.3.jar localhost 6379
+java -jar cache-client/target/cache-client-1.0.4.jar localhost 6379
 ```
 
 or any Redis client, on the same port (JCache speaks the Redis protocol; no
@@ -180,6 +180,7 @@ sources win.
 | `JCACHE_MAX_CONNECTIONS` | | `1000` | Connection limit |
 | `JCACHE_RATE_LIMIT` | `--rate-limit` | `0` | Commands per second per connection; 0 = no limit. `PING` and `QUIT` are not counted |
 | `JCACHE_RATE_LIMIT_BURST` | `--rate-limit-burst` | `0` | Commands a connection may send at once; 0 = same as the rate |
+| `JCACHE_METRICS_PORT` | `--metrics-port` | off | Serve Prometheus metrics at `http://host:<port>/metrics` |
 | `JCACHE_PERSISTENCE_ENABLED` | `--persist` | `false` | Enable snapshot + AOF persistence |
 | `JCACHE_SNAPSHOT_PATH` | `--data-dir` | `./jcache-data` (`/data` in Docker) | Persistence directory |
 | `JCACHE_SNAPSHOT_INTERVAL_MS` | | `300000` | Interval between snapshots |
@@ -188,6 +189,20 @@ sources win.
 The matching properties-file keys are listed in the Javadoc of `ServerConfig`.
 In Docker, JVM options go in `JAVA_OPTS` (default
 `-XX:MaxRAMPercentage=75 -XX:+UseG1GC`).
+
+### Prometheus metrics
+
+With `--metrics-port 9100` the server answers `GET /metrics` on that port with
+the `STATS` counters in the Prometheus text format: `jcache_commands_total`,
+`jcache_hits_total`, `jcache_misses_total`, `jcache_evictions_total`,
+`jcache_errors_total`, `jcache_rate_limited_total`, `jcache_connections_total`,
+`jcache_entries`, `jcache_capacity`, `jcache_connections_active`,
+`jcache_uptime_seconds` and `jcache_latency_seconds{quantile}`. Hit rate is
+`rate(jcache_hits_total[5m]) / ignoring(command) rate(jcache_commands_total{command="get"}[5m])`.
+
+`docker compose -f distribution/docker-compose.yml --profile monitoring up -d`
+starts three nodes with Prometheus on port 9090 and a Grafana dashboard on
+<http://localhost:3000>.
 
 Settings are read once at startup; restart the server (or recreate the
 container) to change them.
@@ -296,7 +311,6 @@ docs/                    architecture, protocol, benchmark results
 ## Roadmap
 
 - Replication between nodes.
-- A Prometheus metrics endpoint.
 
 ## License
 
