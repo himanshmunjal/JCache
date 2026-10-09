@@ -32,6 +32,7 @@ import java.util.function.Function;
  *   <tr><td>server.max.connections</td><td>JCACHE_MAX_CONNECTIONS</td><td>1000</td></tr>
  *   <tr><td>server.rate.limit</td><td>JCACHE_RATE_LIMIT</td><td>0 (off)</td></tr>
  *   <tr><td>server.rate.limit.burst</td><td>JCACHE_RATE_LIMIT_BURST</td><td>0 (same as rate)</td></tr>
+ *   <tr><td>server.metrics.port</td><td>JCACHE_METRICS_PORT</td><td>-1 (off)</td></tr>
  *   <tr><td>server.verbose</td><td>JCACHE_VERBOSE</td><td>false</td></tr>
  *   <tr><td>cache.capacity</td><td>JCACHE_CAPACITY</td><td>10000</td></tr>
  *   <tr><td>cache.policy</td><td>JCACHE_POLICY</td><td>LRU</td></tr>
@@ -73,6 +74,8 @@ public final class ServerConfig {
     public static final int DEFAULT_RATE_LIMIT = 0;
     /** Burst size per connection; 0 means the same as the rate. */
     public static final int DEFAULT_RATE_LIMIT_BURST = 0;
+    /** Port of the Prometheus endpoint; -1 turns it off. */
+    public static final int DEFAULT_METRICS_PORT = -1;
     /** Per-command logging is off unless enabled. */
     public static final boolean DEFAULT_VERBOSE = false;
 
@@ -90,6 +93,7 @@ public final class ServerConfig {
     private final boolean persistenceEnabled;
     private final String snapshotPath;
     private final long snapshotIntervalMs;
+    private final int metricsPort;
     private final boolean verbose;
 
     private ServerConfig(Builder b) {
@@ -107,6 +111,7 @@ public final class ServerConfig {
         this.persistenceEnabled = b.persistenceEnabled;
         this.snapshotPath = b.snapshotPath;
         this.snapshotIntervalMs = b.snapshotIntervalMs;
+        this.metricsPort = b.metricsPort;
         this.verbose = b.verbose;
     }
 
@@ -156,6 +161,7 @@ public final class ServerConfig {
                 .persistenceEnabled(persistenceEnabled)
                 .snapshotPath(snapshotPath)
                 .snapshotIntervalMs(snapshotIntervalMs)
+                .metricsPort(metricsPort)
                 .verbose(verbose);
     }
 
@@ -229,6 +235,11 @@ public final class ServerConfig {
         return snapshotIntervalMs;
     }
 
+    /** @return port of the Prometheus endpoint, 0 for any free port, -1 if it is off */
+    public int getMetricsPort() {
+        return metricsPort;
+    }
+
     /** @return whether every command is logged */
     public boolean isVerbose() {
         return verbose;
@@ -238,10 +249,10 @@ public final class ServerConfig {
     public String toString() {
         return String.format("ServerConfig{port=%d, bossThreads=%d, workerThreads=%d, maxConnections=%d, "
                         + "rateLimit=%d, rateLimitBurst=%d, capacity=%d, policy=%s, segments=%d, defaultTtl=%ds, sweepIntervalMs=%d, "
-                        + "persistence=%b, snapshotPath='%s', snapshotIntervalMs=%d, verbose=%b}",
+                        + "persistence=%b, snapshotPath='%s', snapshotIntervalMs=%d, metricsPort=%d, verbose=%b}",
                 port, bossThreads, workerThreads, maxConnections, rateLimitPerSecond, rateLimitBurst,
                 cacheCapacity, evictionPolicy, segments,
-                defaultTtlSeconds, sweepIntervalMs, persistenceEnabled, snapshotPath, snapshotIntervalMs, verbose);
+                defaultTtlSeconds, sweepIntervalMs, persistenceEnabled, snapshotPath, snapshotIntervalMs, metricsPort, verbose);
     }
 
     /** Builder for {@link ServerConfig}. Setters validate their argument. */
@@ -260,6 +271,7 @@ public final class ServerConfig {
         private boolean persistenceEnabled = DEFAULT_PERSISTENCE_ENABLED;
         private String snapshotPath = DEFAULT_SNAPSHOT_PATH;
         private long snapshotIntervalMs = DEFAULT_SNAPSHOT_INTERVAL_MS;
+        private int metricsPort = DEFAULT_METRICS_PORT;
         private boolean verbose = DEFAULT_VERBOSE;
 
         Builder() {
@@ -421,6 +433,18 @@ public final class ServerConfig {
         }
 
         /**
+         * @param metricsPort port of the Prometheus endpoint, 0 for any free port, -1 to turn it off
+         * @return this builder
+         */
+        public Builder metricsPort(int metricsPort) {
+            if (metricsPort < -1 || metricsPort > 65535) {
+                throw new IllegalArgumentException("metricsPort must be -1 (off) or 0-65535, got: " + metricsPort);
+            }
+            this.metricsPort = metricsPort;
+            return this;
+        }
+
+        /**
          * @param verbose whether to log every command
          * @return this builder
          */
@@ -446,7 +470,7 @@ public final class ServerConfig {
                     "server.max.connections", "server.verbose", "cache.capacity", "cache.policy",
                     "cache.segments", "cache.default.ttl", "cache.sweep.interval.ms", "persistence.enabled",
                     "persistence.snapshot.path", "persistence.snapshot.interval.ms", "server.rate.limit",
-                    "server.rate.limit.burst");
+                    "server.rate.limit.burst", "server.metrics.port");
         }
 
         /**
@@ -460,7 +484,7 @@ public final class ServerConfig {
                     "JCACHE_MAX_CONNECTIONS", "JCACHE_VERBOSE", "JCACHE_CAPACITY", "JCACHE_POLICY",
                     "JCACHE_SEGMENTS", "JCACHE_DEFAULT_TTL", "JCACHE_SWEEP_INTERVAL", "JCACHE_PERSISTENCE_ENABLED",
                     "JCACHE_SNAPSHOT_PATH", "JCACHE_SNAPSHOT_INTERVAL_MS", "JCACHE_RATE_LIMIT",
-                    "JCACHE_RATE_LIMIT_BURST");
+                    "JCACHE_RATE_LIMIT_BURST", "JCACHE_METRICS_PORT");
         }
 
         /** @return the configuration */
@@ -485,6 +509,7 @@ public final class ServerConfig {
             set(source, names[12], v -> snapshotIntervalMs(Long.parseLong(v)));
             set(source, names[13], v -> rateLimitPerSecond(Integer.parseInt(v)));
             set(source, names[14], v -> rateLimitBurst(Integer.parseInt(v)));
+            set(source, names[15], v -> metricsPort(Integer.parseInt(v)));
             return this;
         }
 

@@ -8,7 +8,7 @@
     <parent>
         <groupId>com.cache</groupId>
         <artifactId>JCache</artifactId>
-        <version>1.0.3</version>
+        <version>1.0.4</version>
     </parent>
 
     <artifactId>cache-benchmarks</artifactId>

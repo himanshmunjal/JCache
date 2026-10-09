@@ -1,0 +1,8 @@
+# Scrapes the three nodes in docker-compose.yml.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: jcache
+    static_configs:
+      - targets: ["jcache-1:9100", "jcache-2:9100", "jcache-3:9100"]

@@ -9,7 +9,7 @@ Source, docs and Java client: https://github.com/himanshmunjal/JCache
 ## Tags
 
 - `latest`: the most recent release
-- `1.0.3`: an exact release
+- `1.0.4`: an exact release
 - `1.0`, `1`: the newest release in that line
 
 Images are built for `linux/amd64` and `linux/arm64`.
@@ -74,6 +74,7 @@ Snapshots and the append-only file are written to `/data` and replayed on start-
 | `JCACHE_MAX_CONNECTIONS` | `1000` | Connection limit |
 | `JCACHE_RATE_LIMIT` | `0` | Commands per second per connection; 0 = no limit. `PING` and `QUIT` are not counted |
 | `JCACHE_RATE_LIMIT_BURST` | `0` | Commands a connection may send at once; 0 = same as the rate |
+| `JCACHE_METRICS_PORT` | off | Serve Prometheus metrics at `/metrics` on this port; publish it with `-p` |
 | `JCACHE_PERSISTENCE_ENABLED` | `false` | Enable snapshot + AOF persistence |
 | `JCACHE_SNAPSHOT_PATH` | `/data` | Persistence directory |
 | `JCACHE_SNAPSHOT_INTERVAL_MS` | `300000` | Interval between snapshots |
@@ -115,6 +116,9 @@ docker compose -f distribution/docker-compose.yml up -d
 
 This starts nodes on ports 6379, 6380 and 6381. `ClusterCacheClient`
 shards keys across them with a consistent hash ring.
+
+Add `--profile monitoring` to also start Prometheus (port 9090) and a Grafana
+dashboard on <http://localhost:3000>.
 
 ## Image details
 

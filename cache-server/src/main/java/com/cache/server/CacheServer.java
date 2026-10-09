@@ -8,6 +8,7 @@ import com.cache.server.handler.CacheServerHandler;
 import com.cache.server.handler.ConnectionManager;
 import com.cache.server.handler.ProtocolDetector;
 import com.cache.server.handler.RespCommandHandler;
+import com.cache.server.metrics.PrometheusEndpoint;
 import com.cache.server.metrics.ServerMetrics;
 import com.cache.ttl.TTLCache;
 import io.netty.bootstrap.ServerBootstrap;
@@ -81,6 +82,7 @@ public class CacheServer {
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
+    private volatile PrometheusEndpoint metricsEndpoint;
 
     /**
      * Builds the cache and, if enabled, restores it from disk. Does not open
@@ -134,6 +136,9 @@ public class CacheServer {
                     .channel();
 
             boundPort = ((InetSocketAddress) serverChannel.localAddress()).getPort();
+            if (config.getMetricsPort() >= 0) {
+                metricsEndpoint = new PrometheusEndpoint(config.getMetricsPort(), this::prometheusMetrics);
+            }
             running = true;
             Runtime.getRuntime().addShutdownHook(shutdownHook);
             logStartup();
@@ -208,6 +213,9 @@ public class CacheServer {
             }
         }
         serverChannel.close().syncUninterruptibly();
+        if (metricsEndpoint != null) {
+            metricsEndpoint.stop();
+        }
         connectionManager.closeAllConnections();
         cache.shutdown();
         if (persistence != null) {
@@ -229,6 +237,17 @@ public class CacheServer {
      */
     public int getPort() {
         return boundPort;
+    }
+
+    /**
+     * Returns the port of the Prometheus endpoint. When configured with port
+     * 0 this is the port the operating system picked.
+     *
+     * @return the bound metrics port, or -1 if the endpoint is off or not started
+     */
+    public int getMetricsPort() {
+        PrometheusEndpoint endpoint = metricsEndpoint;
+        return endpoint == null ? -1 : endpoint.getPort();
     }
 
     /** @return the server's metrics */
@@ -291,7 +310,7 @@ public class CacheServer {
                 case "--verbose" -> builder.verbose(true);
                 case "--persist" -> builder.persistenceEnabled(true);
                 case "--config", "--port", "--capacity", "--policy", "--segments", "--default-ttl", "--data-dir",
-                     "--rate-limit", "--rate-limit-burst" -> {
+                     "--rate-limit", "--rate-limit-burst", "--metrics-port" -> {
                     if (i + 1 >= args.length) {
                         throw new IllegalArgumentException(flag + " needs a value");
                     }
@@ -305,6 +324,7 @@ public class CacheServer {
                         case "--data-dir" -> builder.snapshotPath(value);
                         case "--rate-limit" -> builder.rateLimitPerSecond(Integer.parseInt(value));
                         case "--rate-limit-burst" -> builder.rateLimitBurst(Integer.parseInt(value));
+                        case "--metrics-port" -> builder.metricsPort(Integer.parseInt(value));
                         default -> { } // --config was applied first
                     }
                 }
@@ -325,6 +345,7 @@ public class CacheServer {
                 "  --default-ttl <s>   TTL in seconds for writes without one (default 0 = none)",
                 "  --rate-limit <n>    commands per second per connection (default 0 = no limit)",
                 "  --rate-limit-burst <n>  commands a connection may send at once (default = rate)",
+                "  --metrics-port <n>  serve Prometheus metrics over HTTP on this port (default off)",
                 "  --persist           enable snapshot + append-only-file persistence",
                 "  --data-dir <path>   persistence directory (default ./jcache-data)",
                 "  --config <file>     read settings from a properties file",
@@ -339,6 +360,11 @@ public class CacheServer {
                 () -> new CacheServerHandler(cache, metrics, config, persistence),
                 () -> new RespCommandHandler(cache, metrics, config, persistence)));
         pipeline.addLast(connectionManager);
+    }
+
+    private String prometheusMetrics() {
+        return PrometheusEndpoint.format(metrics.snapshot(), cache.getStats().evictions(), cache.size(),
+                config.getCacheCapacity());
     }
 
     private static TTLCache<String, String> buildCache(ServerConfig config) {
@@ -362,6 +388,9 @@ public class CacheServer {
 
     private void logStartup() {
         log.info(startupMessage(boundPort, config));
+        if (metricsEndpoint != null) {
+            log.info("Prometheus metrics on http://0.0.0.0:" + metricsEndpoint.getPort() + "/metrics");
+        }
     }
 
     /** The startup log line; it lists the settings an operator most often needs to confirm. */

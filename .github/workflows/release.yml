@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag such as v1.0.3 to build the jars, create a GitHub release,
+# Push a tag such as v1.0.4 to build the jars, create a GitHub release,
 # publish the Docker image and update the Homebrew tap.
 #
 # Secrets used:

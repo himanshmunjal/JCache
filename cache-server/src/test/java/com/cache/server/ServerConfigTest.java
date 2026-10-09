@@ -112,11 +112,27 @@ class ServerConfigTest {
     }
 
     @Test
+    @DisplayName("Metrics endpoint is off by default and set from every source")
+    void metricsPort(@TempDir Path dir) throws IOException {
+        assertEquals(-1, ServerConfig.defaults().getMetricsPort());
+        assertEquals(9100, ServerConfig.builder()
+                .applyEnvironment(Map.of("JCACHE_METRICS_PORT", "9100")).build().getMetricsPort());
+
+        Path file = dir.resolve("jcache.properties");
+        Files.writeString(file, "server.metrics.port=9101\n");
+        assertEquals(9101, ServerConfig.fromProperties(file.toString()).getMetricsPort());
+
+        assertEquals(9102, CacheServer.parseArgs(new String[]{"--metrics-port", "9102"}).getMetricsPort());
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder().metricsPort(-2));
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.builder().metricsPort(70000));
+    }
+
+    @Test
     @DisplayName("toBuilder() round-trips every setting")
     void toBuilder() {
         ServerConfig original = ServerConfig.builder()
                 .port(1234).cacheCapacity(77).segments(4).defaultTtlSeconds(9).verbose(true)
-                .rateLimitPerSecond(50).rateLimitBurst(80).build();
+                .rateLimitPerSecond(50).rateLimitBurst(80).metricsPort(9100).build();
         assertEquals(original.toString(), original.toBuilder().build().toString());
     }
 }
