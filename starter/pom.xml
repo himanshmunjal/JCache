@@ -10,12 +10,12 @@
     <version>1.0.0</version>
 
     <name>jcache-starter</name>
-    <description>Starter project for using a JCache server from Java.</description>
+    <description>Starter project for using a JCache server from Java, with the JCache client or a Redis client.</description>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <jcache.version>1.0.3</jcache.version>
+        <jcache.version>1.0.4</jcache.version>
         <exec.mainClass>com.example.jcache.QuickStart</exec.mainClass>
     </properties>
 
@@ -24,6 +24,17 @@
             <groupId>com.cache</groupId>
             <artifactId>cache-client</artifactId>
             <version>${jcache.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>5.1.2</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-nop</artifactId>
+            <version>1.7.36</version>
+            <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
